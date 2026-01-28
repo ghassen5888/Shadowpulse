@@ -1,0 +1,70 @@
+services:
+  # Elasticsearch single-node cluster with security disabled
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.2
+    container_name: shadowpulse-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - shadowpulse-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Tor SOCKS proxy
+  tor:
+    image: peterdavehello/tor-socks-proxy:latest
+    container_name: shadowpulse-tor
+    ports:
+      - "9050:9150"
+    networks:
+      - shadowpulse-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9150"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Shadowpulse Python application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: shadowpulse-app
+    environment:
+      # Point to Elasticsearch service instead of localhost
+      - ES_HOST=http://elasticsearch:9200
+      # Point to Tor service instead of localhost
+      - TOR_PROXY_IP=tor
+      - TOR_PORT=9150
+    ports:
+      - "8501:8501"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      tor:
+        condition: service_healthy
+    volumes:
+      # Mount current directory for live code changes during development
+      - .:/app
+    networks:
+      - shadowpulse-network
+    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+
+volumes:
+  elasticsearch_data:
+    driver: local
+
+networks:
+  shadowpulse-network:
+    driver: bridge

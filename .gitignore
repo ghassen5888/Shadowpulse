@@ -1,0 +1,229 @@
+# ============================================================================
+# Python
+# ============================================================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+env.bak/
+venv.bak/
+
+# pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============================================================================
+# Streamlit
+# ============================================================================
+# Streamlit cache and secrets
+.streamlit/
+streamlit_cache/
+.streamlit/secrets.toml
+.streamlit/config.toml
+.streamlit/credentials.toml
+
+# Streamlit session files
+.streamlit_session/
+cache/
+
+# ============================================================================
+# Docker
+# ============================================================================
+# Docker compose override files
+docker-compose.override.yml
+docker-compose.prod.yml
+
+# Docker build artifacts
+.docker/
+
+# Docker volumes (should not commit data)
+elasticsearch/
+elasticsearch-data/
+postgres-data/
+mysql-data/
+
+# ============================================================================
+# Elasticsearch
+# ============================================================================
+# Elasticsearch data directories
+elasticsearch-8.13.2/data/
+elasticsearch-*/data/
+elasticsearch/data/
+.elasticsearch/
+es-data/
+
+# Elasticsearch logs
+elasticsearch-8.13.2/logs/
+elasticsearch-*/logs/
+elasticsearch/logs/
+
+# Elasticsearch plugins cache
+elasticsearch-*/plugins/
+
+# ============================================================================
+# Environment Variables & Secrets
+# ============================================================================
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+.env.secrets
+secrets.json
+credentials.json
+.api_keys
+
+# ============================================================================
+# IDE & Editor
+# ============================================================================
+# VS Code
+.vscode/
+*.code-workspace
+.devcontainer/
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.ipr
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+*~
+.vim/
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ============================================================================
+# Operating System
+# ============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.windows/
+
+# Linux
+.directory
+
+# ============================================================================
+# Project-Specific
+# ============================================================================
+# Local testing/debugging files
+debug_*.py
+test_*.py
+*.log
+logs/
+
+# Local database backups
+*.db
+*.sqlite
+*.sqlite3
+
+# Tor
+tor/
+tor_data/
+.tor/
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Build artifacts
+dist/
+build/
+
+# ============================================================================
+# Documentation
+# ============================================================================
+# Sphinx documentation
+docs/_build/
+docs/.buildinfo
+
+# Generated documentation
+site/
+
+# ============================================================================
+# Keep these important files (even if they match patterns above)
+# ============================================================================
+!.gitkeep
+!.github/
+!.github/**
+
+
+*.tar.gz
