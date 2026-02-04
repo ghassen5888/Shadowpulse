@@ -229,6 +229,35 @@ def update_link_status(client, thread_id, url, status_code):
         print(f"Error updating status: {e}") 
         return False
 
+def delete_intel_update(client, thread_id, url):
+    """
+    Delete a specific intelligence update (discovered link) from Elasticsearch.
+    
+    This function removes a single onion URL and all associated metadata
+    from a specific thread. Used when users delete individual links or
+    bulk delete all dead links from an operation.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        thread_id (str): The operation/thread containing the link to delete
+        url (str): The onion URL to delete
+    
+    Returns:
+        bool: True if deletion succeeded, False if it failed or document not found.
+    """
+    # Construct the unique document ID (matches the ID used in save_intel_update)
+    # Format: "{thread_id}_{url}"
+    unique_id = f"{thread_id}_{url}"
+    
+    try:
+        # Delete the document from Elasticsearch by its unique ID
+        response = client.delete(index=config.INDEX_NAME, id=unique_id)
+        print(f"[Database] Deleted intel: {url} from Thread {thread_id}")
+        return True
+    except Exception as e:
+        print(f"[Database] Error deleting intel: {e}")
+        return False
+
 def get_dashboard_stats(client):
     """
     Get statistics about all operations for the dashboard summary.

@@ -129,20 +129,22 @@ def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10, 
                 result = future.result(timeout=20)
                 url, code = result
                 
-                with results_lock:
-                    completed_count += 1
-                    results.append(result)
-                    
-                    # Call progress callback if provided
-                    if progress_callback:
-                        progress_callback(completed_count, total_links, url, code)
-                        
             except Exception as e:
                 print(f"[Status Check] Future error: {e}")
-                with results_lock:
-                    completed_count += 1
-                    if progress_callback:
-                        progress_callback(completed_count, total_links, "error", 500)
+                url = "error"
+                code = 500
+            
+            # Always increment completed count and call callback (whether success or error)
+            with results_lock:
+                completed_count += 1
+                if code != 500 or url != "error":  # Only append successful results
+                    results.append((url, code))
+                
+                # Call progress callback with clamped progress value (0.0 to 1.0)
+                if progress_callback:
+                    # Clamp progress_percent to max 1.0 to prevent Streamlit errors
+                    clamped_percent = min(completed_count / total_links, 1.0)
+                    progress_callback(completed_count, total_links, url, code)
     
     return results
 
@@ -292,9 +294,14 @@ if st.session_state["current_thread_name"]:
                 
                 def update_progress(completed, total, url, code):
                     """Callback function to update progress bar in real-time"""
-                    progress_percent = completed / total
+                    # Clamp progress percent to [0.0, 1.0] to prevent Streamlit API errors
+                    progress_percent = min(completed / total, 1.0)
                     status_icon = "✅" if code == 200 else "❌"
-                    url_display = url.split('/')[-1][:40] if url != "error" else "error"
+                    # Handle None URL gracefully
+                    if url and url != "error":
+                        url_display = url.split('/')[-1][:40]
+                    else:
+                        url_display = "error" if url == "error" else "unknown"
                     status_text.write(f"🔍 Pinging... **{url_display}** {status_icon} ({completed}/{total} checked)")
                     progress_bar.progress(progress_percent)
                 
@@ -317,6 +324,30 @@ if st.session_state["current_thread_name"]:
                 
                 time.sleep(1)
                 st.rerun()
+            
+            # --- DELETE ALL DEAD LINKS BUTTON ---
+            # Displays "Delete All Dead Links" button to remove all links with status code != 200
+            if st.button("🗑️ Delete All Dead Links", key="delete_all_dead"):
+                # Filter for dead links (status code not 200 or 0)
+                dead_links = [u for u in updates if u.get('last_status_code') not in [200, 0]]
+                
+                if dead_links:
+                    # Delete each dead link from the database
+                    for link in dead_links:
+                        try:
+                            database.delete_intel_update(
+                                es_client, 
+                                st.session_state["current_thread_id"], 
+                                link.get('onion_url')
+                            )
+                        except Exception as e:
+                            print(f"Error deleting {link.get('onion_url')}: {e}")
+                    
+                    st.success(f"✅ Deleted {len(dead_links)} dead links")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.info("ℹ️ No dead links to delete. All links are either active or untested.")
 
     if updates :
         for update in updates:
@@ -336,7 +367,10 @@ if st.session_state["current_thread_name"]:
                 summary = update.get('summary', 'No summary.')
                 st.info(summary)
                 
-                c1, c2 = st.columns([1, 4])
+                # --- ACTION BUTTONS SECTION ---
+                # Create two columns: one for Deep Crawl and one for Delete button
+                c1, c2, c3 = st.columns([1, 1, 4])
+                
                 with c1:
                     if st.button("🕷 Deep Crawl", key=f"btn_{update.get('onion_url')}"):
                         import crawler
@@ -356,7 +390,26 @@ if st.session_state["current_thread_name"]:
                                     st.rerun()
                             else:
                                 st.error("Site unreachable.")
+                
+                # --- DELETE INDIVIDUAL LINK BUTTON ---
+                # Displays delete button for each link to remove it from the operation
+                # Delete button is always available for any link regardless of status
                 with c2:
+                    if st.button("🗑️ Delete Link", key=f"del_{update.get('onion_url')}"):
+                        try:
+                            # Call database function to delete the specific link/update from this operation
+                            database.delete_intel_update(
+                                es_client, 
+                                st.session_state["current_thread_id"], 
+                                update.get('onion_url')
+                            )
+                            st.success("✅ Link deleted")
+                            time.sleep(0.5)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Error deleting link: {e}")
+                
+                with c3:
                     with st.expander("View Raw Data"):
                         st.code(update.get('full_content'))
                 
