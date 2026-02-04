@@ -40,7 +40,7 @@ st.markdown("### Dark Web Threat Intelligence Scanner")
 st.divider()
 
 # --- Helper: Multithreaded Link Status Checker ---
-def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10):
+def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10, progress_callback=None):
     """
     Check the HTTP status of multiple onion links concurrently using ThreadPoolExecutor.
     
@@ -54,6 +54,7 @@ def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10):
     2. Records the HTTP status code (200=OK, 404=Not Found, 500=Server Error, etc.)
     3. Updates Elasticsearch immediately with the new status
     4. Moves to the next URL
+    5. Calls progress_callback (if provided) to update UI in real-time
     
     The function is thread-safe and doesn't freeze the UI because the actual
     threading happens in the ThreadPoolExecutor context, separate from Streamlit's
@@ -65,14 +66,19 @@ def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10):
         thread_id (str): Current operation/thread ID (for database queries)
         max_workers (int): Maximum concurrent threads. Defaults to 10.
                           This means up to 10 Tor circuits will be used simultaneously.
+        progress_callback (function): Optional callback function that accepts 
+                                     (completed_count, total_links, url, status_code)
+                                     for real-time progress tracking.
     
     Returns:
         list: List of tuples: [(url, status_code), ...]
               Example: [('http://site1.onion', 200), ('http://site2.onion', 500)]
     """
     results = []
-    # Lock for thread-safe list appends (though Python list.append is atomic anyway)
-    results_lock = threading.Lock() #threading.lock : one append at a time
+    total_links = len(updates)
+    completed_count = 0
+    # Lock for thread-safe list appends and counter updates
+    results_lock = threading.Lock()
     
     def ping_single_url(update):
         """
@@ -121,10 +127,22 @@ def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10):
             try:
                 # Wait up to 20 seconds for this future (includes ping_single_url's 15s timeout + overhead)
                 result = future.result(timeout=20)
-                with results_lock: #unnecessary defensive programming : forloop does not work simultaneously
+                url, code = result
+                
+                with results_lock:
+                    completed_count += 1
                     results.append(result)
+                    
+                    # Call progress callback if provided
+                    if progress_callback:
+                        progress_callback(completed_count, total_links, url, code)
+                        
             except Exception as e:
                 print(f"[Status Check] Future error: {e}")
+                with results_lock:
+                    completed_count += 1
+                    if progress_callback:
+                        progress_callback(completed_count, total_links, "error", 500)
     
     return results
 
@@ -194,25 +212,44 @@ if st.session_state["current_thread_name"]:
         st.write("")
         scan_btn = st.button("🔍 Scan & Attach", type="primary")
     
-    if scan_btn and query:  
-      with st.spinner(f"Searching dark web for '{query}'..."):
-         results = search_engine.search_parallel(query, max_workers=8)
+    if scan_btn and query:
+      # Create containers for progress display
+      progress_container = st.container()
+      progress_bar = progress_container.progress(0)
+      status_text = progress_container.empty()
+      results_placeholder = progress_container.empty()
+      
+      def update_progress(completed, total, engine_url):
+          """Callback function to update progress bar in real-time"""
+          progress_percent = completed / total
+          engine_name = engine_url.split('/')[2] if '/' in engine_url else engine_url
+          status_text.write(f"🔍 Searching... **{engine_name}** ✓ ({completed}/{total} engines)")
+          progress_bar.progress(progress_percent)
+      
+      results = search_engine.search_parallel(query, max_workers=8, progress_callback=update_progress)
 
-         if results:
-             for item in results:
-                database.save_intel_update(
-                        es_client, 
-                        st.session_state["current_thread_id"], 
-                        item['onion_url'],
-                        item['title'],
-                        "Meta search result (Pending Crawl)", 
-                        tags=[query]
-                    )
-             st.success(f"✅ Attached {len(results)} new leads to operation.")
-             time.sleep(1)
-             st.rerun()
-         else:
-             st.warning("No new intelligence found.")
+      if results:
+          # Clear progress display and show completion
+          progress_bar.progress(1.0)
+          status_text.success(f"✅ Search Complete! Found {len(results)} unique leads")
+          
+          # Save results to database
+          for item in results:
+              database.save_intel_update(
+                      es_client, 
+                      st.session_state["current_thread_id"], 
+                      item['onion_url'],
+                      item['title'],
+                      "Meta search result (Pending Crawl)", 
+                      tags=[query]
+                  )
+          
+          st.success(f"✅ Attached {len(results)} new leads to operation.")
+          time.sleep(1)
+          st.rerun()
+      else:
+          progress_bar.progress(0)
+          status_text.warning("⚠️ No new intelligence found.")
 
     st.divider()
     st.write("### 📝 Intelligence Feed")
@@ -248,23 +285,36 @@ if st.session_state["current_thread_name"]:
         with stat_col2:
             st.write("")
             if st.button("🔄 Check Link Status (Ping All)"):
-                progress_container = st.empty()
+                # Create containers for progress display
+                progress_bar = st.progress(0)
                 status_text = st.empty()
+                results_text = st.empty()
                 
-                # Run concurrent status check
-                with st.spinner("🔍 Checking status of all links in parallel..."):
-                    results = check_link_status_concurrent(
-                        updates, 
-                        es_client, 
-                        st.session_state["current_thread_id"],
-                        max_workers=10
-                    )
+                def update_progress(completed, total, url, code):
+                    """Callback function to update progress bar in real-time"""
+                    progress_percent = completed / total
+                    status_icon = "✅" if code == 200 else "❌"
+                    url_display = url.split('/')[-1][:40] if url != "error" else "error"
+                    status_text.write(f"🔍 Pinging... **{url_display}** {status_icon} ({completed}/{total} checked)")
+                    progress_bar.progress(progress_percent)
+                
+                # Run concurrent status check with progress callback
+                results = check_link_status_concurrent(
+                    updates, 
+                    es_client, 
+                    st.session_state["current_thread_id"],
+                    max_workers=10,
+                    progress_callback=update_progress
+                )
                 
                 # Show summary
                 alive = sum(1 for _, code in results if code == 200)
                 dead = len(results) - alive
                 
-                st.success(f"✅ Status check complete! {alive} active, {dead} down.")
+                progress_bar.progress(1.0)
+                status_text.success(f"✅ Status check complete!")
+                results_text.info(f"📊 Results: **{alive}** active 🟢 | **{dead}** down 🔴")
+                
                 time.sleep(1)
                 st.rerun()
 

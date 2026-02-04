@@ -93,7 +93,7 @@ def fetch_from_engine(url_template, query):
         return []
 
 
-def search_parallel(query, max_workers=8):
+def search_parallel(query, max_workers=8, progress_callback=None):
     """
     Search multiple dark web search engines in parallel for a query.
     
@@ -110,11 +110,15 @@ def search_parallel(query, max_workers=8):
     - as_completed() pattern: Process results as they arrive, not in order
     - Thread-safe deduplication by .onion_url
     - Individual engine failures don't block the entire search
+    - Real-time progress updates via callback
     
     Args:
         query (str): Search term to find on dark web
         max_workers (int): Maximum concurrent threads. Defaults to 8.
                           Higher = faster but uses more resources/Tor circuits.
+        progress_callback (function): Optional callback function that accepts 
+                                     (completed_count, total_engines, engine_url)
+                                     for real-time progress tracking.
     
     Returns:
         list: List of unique dictionaries (deduplicated by onion_url) containing:
@@ -124,8 +128,12 @@ def search_parallel(query, max_workers=8):
     """
     all_results = []
     engines = config.SEARCH_ENGINES
+    total_engines = len(engines)
     
-    print(f"🔍 Starting parallel search across {len(engines)} engines (max_workers={max_workers})...")
+    print(f"🔍 Starting parallel search across {total_engines} engines (max_workers={max_workers})...")
+    
+    # Calculate progress increment per engine (with buffer for deduplication phase)
+    progress_per_engine = 1.0 / total_engines
     
     # Create a thread pool executor with max_workers threads
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -141,16 +149,28 @@ def search_parallel(query, max_workers=8):
         completed_count = 0
         for future in as_completed(futures):
             completed_count += 1
+            engine_url = futures[future]
             try:
                 # Wait up to 20 seconds for this future to return
                 # (timeout is a safety measure; fetch_from_engine has its own 15s timeout)
                 data = future.result(timeout=20)
                 if data:
                     all_results.extend(data)
-                print(f"   [Progress: {completed_count}/{len(engines)} engines done]")
+                    results_found = len(data)
+                else:
+                    results_found = 0
+                
+                print(f"   [Progress: {completed_count}/{total_engines} engines done] {engine_url.split('/')[2]} (+{results_found} links)")
+                
+                # Call progress callback if provided
+                if progress_callback:
+                    progress_callback(completed_count, total_engines, engine_url)
+                    
             except Exception as e:
                 # If an engine fails, log it but continue with other engines
                 print(f"   ⚠️  Engine failed: {e}")
+                if progress_callback:
+                    progress_callback(completed_count, total_engines, engine_url)
 
     # Deduplicate results by .onion_url using a dictionary.
     # This ensures that if multiple engines found the same link,
@@ -163,6 +183,10 @@ def search_parallel(query, max_workers=8):
     
     unique_list = list(unique_results.values())
     print(f"📊 Total unique results: {len(unique_list)} (from {len(all_results)} duplicates)")
+    
+    # Final callback for 100% completion
+    if progress_callback:
+        progress_callback(total_engines, total_engines, "Deduplication complete")
     
     return unique_list
 
