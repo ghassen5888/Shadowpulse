@@ -299,7 +299,8 @@ if st.session_state["current_thread_name"]:
                                     update.get('onion_url'),
                                     update.get('title'),
                                     content,
-                                    tags=update.get('tags', [])
+                                    tags=update.get('tags', []),
+                                    last_status_code=200
                                 )
                                     st.success("Extracted!")
                                     st.rerun()

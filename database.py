@@ -142,7 +142,7 @@ def get_all_threads(client):
     # Extract thread ID and name from each search result hit
     return [{"id": h['_source']['thread_id'], "name": h['_source']['name']} for h in resp['hits']['hits']]
 
-def save_intel_update(client, thread_id, url, title, content, tags=[]):
+def save_intel_update(client, thread_id, url, title, content, tags=[] ,last_status_code=0):
     """
     Save an intelligence update (discovered link) to Elasticsearch.
     
@@ -171,7 +171,7 @@ def save_intel_update(client, thread_id, url, title, content, tags=[]):
         "full_content": content,                   # Full page content for deep search
         "scraped_at": datetime.now().isoformat(), # ISO timestamp of when we scraped it
         "tags": tags,                              # User-defined tags for search/filter
-        "last_status_code": 0                      # 0 = unknown/not yet checked
+        "last_status_code":last_status_code                       
     }
     
     # Create a unique ID by combining thread_id and URL.
@@ -197,7 +197,7 @@ def get_thread_data(client, thread_id):
     }
     
     # Execute the search
-    resp = client.search(index=config.INDEX_NAME, query=query, size=100, sort=[{"scraped_at": "desc"}])
+    resp = client.search(index=config.INDEX_NAME, query=query, size=100, sort=[{"onion_url.keyword": "asc"}])
     
     return [h['_source'] for h in resp['hits']['hits']]
 
