@@ -205,6 +205,40 @@ if es_client:
            st.rerun()
    
    st.sidebar.divider()
+   
+   # --- KEYWORDS SECTION IN SIDEBAR ---
+   if st.session_state["current_page"] == "thread" and st.session_state["current_thread_name"]:
+       st.sidebar.write("### 🏷️ Keywords")
+       keywords = database.get_thread_keywords(es_client, st.session_state["current_thread_id"])
+       
+       # Manual keyword input in sidebar
+       new_keyword = st.sidebar.text_input("Add Keyword", placeholder="Type keyword...", key="sidebar_keyword_input")
+       if st.sidebar.button("➕ Add", key="sidebar_add_keyword_btn", use_container_width=True):
+           if new_keyword.strip():
+               if database.add_keyword_to_thread(es_client, st.session_state["current_thread_id"], new_keyword):
+                   st.sidebar.success(f"✅ Added '{new_keyword}'")
+                   time.sleep(0.5)
+                   st.rerun()
+               else:
+                   st.sidebar.warning(f"⚠️ Already exists")
+           else:
+               st.sidebar.error("❌ Empty")
+       
+       # Display keywords in sidebar
+       if keywords:
+           st.sidebar.write(f"**{len(keywords)} keyword(s):**")
+           for keyword in keywords:
+               col1, col2 = st.sidebar.columns([3, 1])
+               with col1:
+                   st.write(f"🔹 {keyword}")
+               with col2:
+                   if st.button("🗑️", key=f"del_kw_sidebar_{keyword}", help="Delete"):
+                       database.remove_keyword_from_thread(es_client, st.session_state["current_thread_id"], keyword)
+                       st.rerun()
+       else:
+           st.sidebar.caption("No keywords yet.")
+   
+   st.sidebar.divider()
    st.sidebar.caption("System Status")
    if es_client: 
     st.sidebar.success("Database: Online 🟢")
@@ -262,6 +296,9 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                       "Meta search result (Pending Crawl)", 
                       tags=[query]
                   )
+          
+          # Auto-add the search query as a keyword
+          database.add_keyword_to_thread(es_client, st.session_state["current_thread_id"], query)
           
           st.success(f"✅ Attached {len(results)} new leads to operation.")
           time.sleep(1)

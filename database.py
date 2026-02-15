@@ -577,3 +577,107 @@ def get_all_banned_links(client, thread_id):
     local_bans = get_local_banned_links(client, thread_id)
     global_bans = get_global_banned_links(client)
     return local_bans + global_bans
+
+# --- KEYWORDS SYSTEM ---
+
+def add_keyword_to_thread(client, thread_id, keyword):
+    """
+    Add a keyword to a thread's keyword list.
+    
+    Keywords are tracked per thread to keep a list of search terms and manual entries.
+    If the keyword already exists, it won't be added again.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        thread_id (str): The thread ID
+        keyword (str): The keyword to add (will be lowercased and stripped)
+    
+    Returns:
+        bool: True if added successfully, False if it already exists or error occurred
+    """
+    try:
+        # Normalize keyword
+        keyword = keyword.strip().lower()
+        
+        if not keyword:
+            return False
+        
+        # Create a keyword document
+        doc = {
+            "type": "thread_keyword",
+            "thread_id": thread_id,
+            "keyword": keyword,
+            "added_at": datetime.now().isoformat()
+        }
+        
+        # Use keyword as part of unique ID to prevent duplicates
+        unique_id = f"keyword_{thread_id}_{keyword}"
+        
+        # Check if keyword already exists
+        try:
+            existing = client.get(index=config.INDEX_NAME, id=unique_id)
+            print(f"[Database] Keyword '{keyword}' already exists in thread {thread_id}")
+            return False
+        except:
+            pass  # Keyword doesn't exist yet, proceed to add it
+        
+        # Add the keyword
+        client.index(index=config.INDEX_NAME, id=unique_id, document=doc)
+        print(f"[Database] Added keyword '{keyword}' to thread {thread_id}")
+        return True
+    except Exception as e:
+        print(f"[Database] Error adding keyword: {e}")
+        return False
+
+def remove_keyword_from_thread(client, thread_id, keyword):
+    """
+    Remove a keyword from a thread's keyword list.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        thread_id (str): The thread ID
+        keyword (str): The keyword to remove
+    
+    Returns:
+        bool: True if removed successfully, False otherwise
+    """
+    try:
+        # Normalize keyword
+        keyword = keyword.strip().lower()
+        
+        unique_id = f"keyword_{thread_id}_{keyword}"
+        client.delete(index=config.INDEX_NAME, id=unique_id)
+        print(f"[Database] Removed keyword '{keyword}' from thread {thread_id}")
+        return True
+    except Exception as e:
+        print(f"[Database] Error removing keyword: {e}")
+        return False
+
+def get_thread_keywords(client, thread_id):
+    """
+    Get all keywords for a specific thread.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        thread_id (str): The thread ID
+    
+    Returns:
+        list: List of keyword strings, sorted alphabetically
+    """
+    try:
+        query = {
+            "bool": {
+                "must": [
+                    {"term": {"type.keyword": "thread_keyword"}},
+                    {"term": {"thread_id": thread_id}}
+                ]
+            }
+        }
+        resp = client.search(index=config.INDEX_NAME, query=query, size=500)
+        
+        # Extract keywords and sort them
+        keywords = [h['_source']['keyword'] for h in resp['hits']['hits']]
+        return sorted(keywords)
+    except Exception as e:
+        print(f"[Database] Error getting thread keywords: {e}")
+        return []
