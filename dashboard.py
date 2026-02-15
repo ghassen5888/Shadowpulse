@@ -32,6 +32,8 @@ if "current_thread_id" not in st.session_state:
     st.session_state["current_thread_id"] = None
 if "current_thread_name" not in st.session_state:
     st.session_state["current_thread_name"] = None
+if "current_page" not in st.session_state:
+    st.session_state["current_page"] = "thread"  # "thread" or "banned_links"
 
 # --- Title & Header ---
 st.title("🕵️‍♂️ Shadowpulse: Thread Intel")
@@ -186,8 +188,22 @@ if es_client:
       if st.sidebar.button("📂 Load Operation"):
            st.session_state["current_thread_id"]= options[selected_name]
            st.session_state["current_thread_name"]= selected_name
+           st.session_state["current_page"] = "thread"
            st.rerun()
 
+   st.sidebar.divider()
+   
+   # Banned Links Button
+   if st.sidebar.button("🚫 Banned Links", use_container_width=True):
+       st.session_state["current_page"] = "banned_links"
+       st.rerun()
+   
+   # Back to Thread Button (only shown if on banned_links page)
+   if st.session_state["current_page"] == "banned_links":
+       if st.sidebar.button("← Back to Operation", use_container_width=True):
+           st.session_state["current_page"] = "thread"
+           st.rerun()
+   
    st.sidebar.divider()
    st.sidebar.caption("System Status")
    if es_client: 
@@ -202,7 +218,8 @@ if es_client:
 
 #__main screen___
 
-if st.session_state["current_thread_name"]:
+# PAGE: THREAD INTELLIGENCE (Main Thread View)
+if st.session_state["current_page"] == "thread" and st.session_state["current_thread_name"]:
     st.subheader(f"📡 Operation: {st.session_state['current_thread_name']}")
     st.caption(f"Case ID: {st.session_state['current_thread_id']}")
     
@@ -367,9 +384,9 @@ if st.session_state["current_thread_name"]:
                 summary = update.get('summary', 'No summary.')
                 st.info(summary)
                 
-                # --- ACTION BUTTONS SECTION ---
-                # Create two columns: one for Deep Crawl and one for Delete button
-                c1, c2, c3 = st.columns([1, 1, 4])
+                # --- BAN BUTTONS SECTION ---
+                # Create three columns: one for Ban Locally, one for Ban Globally, one for Delete
+                c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
                 
                 with c1:
                     if st.button("🕷 Deep Crawl", key=f"btn_{update.get('onion_url')}"):
@@ -391,33 +408,137 @@ if st.session_state["current_thread_name"]:
                             else:
                                 st.error("Site unreachable.")
                 
-                # --- DELETE INDIVIDUAL LINK BUTTON ---
-                # Displays delete button for each link to remove it from the operation
-                # Delete button is always available for any link regardless of status
+                # --- BAN LOCALLY BUTTON ---
+                # Removes link from this thread and prevents it from appearing in future scans
                 with c2:
-                    if st.button("🗑️ Delete Link", key=f"del_{update.get('onion_url')}"):
+                    if st.button("🚫 Ban Local", key=f"ban_local_{update.get('onion_url')}"):
                         try:
-                            # Call database function to delete the specific link/update from this operation
+                            database.ban_link_locally(
+                                es_client, 
+                                st.session_state["current_thread_id"], 
+                                update.get('onion_url')
+                            )
                             database.delete_intel_update(
                                 es_client, 
                                 st.session_state["current_thread_id"], 
                                 update.get('onion_url')
                             )
-                            st.success("✅ Link deleted")
+                            st.success("✅ Locally banned & removed")
                             time.sleep(0.5)
                             st.rerun()
                         except Exception as e:
-                            st.error(f"❌ Error deleting link: {e}")
+                            st.error(f"❌ Error banning link: {e}")
                 
+                # --- BAN GLOBALLY BUTTON ---
+                # Removes link from all threads and prevents it from appearing in any future scans
                 with c3:
+                    if st.button("🛑 Ban Global", key=f"ban_global_{update.get('onion_url')}"):
+                        try:
+                            database.ban_link_globally(
+                                es_client, 
+                                update.get('onion_url')
+                            )
+                            # Delete from ALL threads
+                            deleted_count = database.delete_link_from_all_threads(
+                                es_client,
+                                update.get('onion_url')
+                            )
+                            st.success(f"✅ Globally banned & removed from {deleted_count} thread(s)")
+                            time.sleep(0.5)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Error banning link: {e}")
+                
+                with c4:
                     with st.expander("View Raw Data"):
                         st.code(update.get('full_content'))
                 
                 st.markdown("---")
     else:
        st.info("No intelligence gathered for this operation yet. Run a scan above.")
+
+# PAGE: BANNED LINKS MANAGEMENT
+elif st.session_state["current_page"] == "banned_links":
+    st.title("🚫 Banned Links Management")
+    st.write("View and manage locally and globally banned links.")
+    st.divider()
+    
+    if not es_client:
+        st.error("❌ Database offline. Cannot access banned links.")
+    else:
+        # Get current thread ID and all banned links
+        thread_id = st.session_state["current_thread_id"]
+        
+        # Create tabs for Local and Global bans
+        tab1, tab2 = st.tabs(["Local Bans (This Thread)", "Global Bans (All Threads)"])
+        
+        # --- TAB 1: LOCAL BANS ---
+        with tab1:
+            if thread_id:
+                local_bans = database.get_local_banned_links(es_client, thread_id)
+                
+                if local_bans:
+                    st.write(f"**{len(local_bans)} locally banned link(s)** in this operation")
+                    st.divider()
+                    
+                    for ban in local_bans:
+                        url = ban.get('banned_url')
+                        banned_at = ban.get('banned_at', 'Unknown')
+                        
+                        col1, col2 = st.columns([5, 1])
+                        with col1:
+                            st.markdown(f"🔗 **{url}**")
+                            st.caption(f"Banned at: {banned_at}")
+                        
+                        with col2:
+                            if st.button("↩️ Unban", key=f"unban_local_{url}"):
+                                try:
+                                    database.unban_link_locally(es_client, thread_id, url)
+                                    st.success(f"✅ Unbanned! Link will show up in future scans.")
+                                    time.sleep(1)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ Error unbanning: {e}")
+                        
+                        st.divider()
+                else:
+                    st.info("ℹ️ No locally banned links in this operation.")
+            else:
+                st.warning("⚠️ Please select an operation first to view local bans.")
+        
+        # --- TAB 2: GLOBAL BANS ---
+        with tab2:
+            global_bans = database.get_global_banned_links(es_client)
+            
+            if global_bans:
+                st.write(f"**{len(global_bans)} globally banned link(s)** across all operations")
+                st.divider()
+                
+                for ban in global_bans:
+                    url = ban.get('banned_url')
+                    banned_at = ban.get('banned_at', 'Unknown')
+                    
+                    col1, col2 = st.columns([5, 1])
+                    with col1:
+                        st.markdown(f"🔗 **{url}**")
+                        st.caption(f"Banned at: {banned_at}")
+                    
+                    with col2:
+                        if st.button("↩️ Unban", key=f"unban_global_{url}"):
+                            try:
+                                database.unban_link_globally(es_client, url)
+                                st.success(f"✅ Unbanned! Link will show up in future scans.")
+                                time.sleep(1)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Error unbanning: {e}")
+                    
+                    st.divider()
+            else:
+                st.info("ℹ️ No globally banned links.")
+
 else:
-    # --- WELCOME SCREEN (No Thread Selected) ---
+    # --- WELCOME SCREEN (No Thread Selected or on Welcome) ---
     st.write("## 👋 Welcome, Analyst.")
     st.info("👈 Please Select or Create an Operation in the sidebar to begin.")
     

@@ -150,6 +150,9 @@ def save_intel_update(client, thread_id, url, title, content, tags=[] ,last_stat
     (title, content, tags, status). This function creates a new intel document
     linked to a specific thread.
     
+    Before saving, this function checks if the URL is locally or globally banned.
+    If it is banned, the save is skipped.
+    
     Args:
         client (Elasticsearch): Elasticsearch client instance
         thread_id (str): The operation/thread this intel belongs to
@@ -159,8 +162,18 @@ def save_intel_update(client, thread_id, url, title, content, tags=[] ,last_stat
         tags (list): Optional list of tags/keywords (defaults to empty list)
     
     Returns:
-        None. Prints status to console.
+        bool: True if saved successfully, False if banned or error occurred.
     """
+    # Check if URL is globally banned
+    if is_url_globally_banned(client, url):
+        print(f"[Database] Skipped saving {url} - globally banned")
+        return False
+    
+    # Check if URL is locally banned in this thread
+    if is_url_locally_banned(client, thread_id, url):
+        print(f"[Database] Skipped saving {url} - locally banned in thread {thread_id}")
+        return False
+    
     # Create the intel update document structure
     doc = {
         "type": "intel_update",                    # Document type identifier
@@ -180,6 +193,7 @@ def save_intel_update(client, thread_id, url, title, content, tags=[] ,last_stat
     unique_id = f"{thread_id}_{url}"
     client.index(index=config.INDEX_NAME, id=unique_id, document=doc)
     print(f"[Database] Attached intel to Thread {thread_id}")
+    return True
 
 def get_thread_data(client, thread_id):
     """
@@ -258,6 +272,43 @@ def delete_intel_update(client, thread_id, url):
         print(f"[Database] Error deleting intel: {e}")
         return False
 
+def delete_link_from_all_threads(client, url):
+    """
+    Delete a specific link from ALL threads in the database.
+    
+    This is used when globally banning a link to remove it from every operation.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        url (str): The onion URL to delete from all threads
+    
+    Returns:
+        int: Number of threads the link was deleted from
+    """
+    try:
+        # Get all threads first
+        threads = get_all_threads(client)
+        
+        deleted_count = 0
+        # For each thread, construct the document ID and delete it
+        # The ID format is: "{thread_id}_{url}"
+        for thread in threads:
+            thread_id = thread['id']
+            unique_id = f"{thread_id}_{url}"
+            try:
+                client.delete(index=config.INDEX_NAME, id=unique_id)
+                deleted_count += 1
+                print(f"[Database] Deleted {url} from thread {thread_id}")
+            except Exception as e:
+                # Document might not exist in this thread, which is fine
+                print(f"[Database] Tried to delete from thread {thread_id}, not found or error: {e}")
+        
+        print(f"[Database] Deleted {url} from {deleted_count} thread(s)")
+        return deleted_count
+    except Exception as e:
+        print(f"[Database] Error deleting link from all threads: {e}")
+        return 0
+
 def get_dashboard_stats(client):
     """
     Get statistics about all operations for the dashboard summary.
@@ -315,3 +366,214 @@ def get_dashboard_stats(client):
         stats.append({"name": t_name, "count": count})
     
     return stats
+
+# --- BAN/UNBAN SYSTEM ---
+
+def ban_link_locally(client, thread_id, url):
+    """
+    Ban a link locally within a specific thread.
+    
+    This prevents the link from being saved to this thread again during future scans,
+    but allows it to appear in other threads.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        thread_id (str): The thread ID to ban the link in
+        url (str): The onion URL to ban
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        doc = {
+            "type": "banned_link",
+            "ban_type": "local",
+            "thread_id": thread_id,
+            "banned_url": url,
+            "banned_at": datetime.now().isoformat()
+        }
+        unique_id = f"ban_local_{thread_id}_{url}"
+        client.index(index=config.INDEX_NAME, id=unique_id, document=doc)
+        print(f"[Database] Locally banned {url} in thread {thread_id}")
+        return True
+    except Exception as e:
+        print(f"[Database] Error banning link locally: {e}")
+        return False
+
+def ban_link_globally(client, url):
+    """
+    Ban a link globally across all threads.
+    
+    This prevents the link from appearing in any thread, and prevents it from
+    being returned by searches.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        url (str): The onion URL to ban globally
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        doc = {
+            "type": "banned_link",
+            "ban_type": "global",
+            "banned_url": url,
+            "banned_at": datetime.now().isoformat()
+        }
+        unique_id = f"ban_global_{url}"
+        client.index(index=config.INDEX_NAME, id=unique_id, document=doc)
+        print(f"[Database] Globally banned {url}")
+        return True
+    except Exception as e:
+        print(f"[Database] Error banning link globally: {e}")
+        return False
+
+def unban_link_locally(client, thread_id, url):
+    """
+    Unban a link locally in a specific thread.
+    
+    Removes the local ban so the link can appear in this thread again during future scans.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        thread_id (str): The thread ID to unban the link from
+        url (str): The onion URL to unban
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        unique_id = f"ban_local_{thread_id}_{url}"
+        client.delete(index=config.INDEX_NAME, id=unique_id)
+        print(f"[Database] Locally unbanned {url} in thread {thread_id}")
+        return True
+    except Exception as e:
+        print(f"[Database] Error unbanning link locally: {e}")
+        return False
+
+def unban_link_globally(client, url):
+    """
+    Unban a link globally.
+    
+    Removes the global ban so the link can appear in searches and threads again.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        url (str): The onion URL to unban
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        unique_id = f"ban_global_{url}"
+        client.delete(index=config.INDEX_NAME, id=unique_id)
+        print(f"[Database] Globally unbanned {url}")
+        return True
+    except Exception as e:
+        print(f"[Database] Error unbanning link globally: {e}")
+        return False
+
+def is_url_locally_banned(client, thread_id, url):
+    """
+    Check if a URL is banned locally in a specific thread.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        thread_id (str): The thread ID to check
+        url (str): The onion URL to check
+    
+    Returns:
+        bool: True if the URL is locally banned, False otherwise
+    """
+    try:
+        unique_id = f"ban_local_{thread_id}_{url}"
+        response = client.get(index=config.INDEX_NAME, id=unique_id)
+        return response['found']
+    except:
+        return False
+
+def is_url_globally_banned(client, url):
+    """
+    Check if a URL is banned globally.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        url (str): The onion URL to check
+    
+    Returns:
+        bool: True if the URL is globally banned, False otherwise
+    """
+    try:
+        unique_id = f"ban_global_{url}"
+        response = client.get(index=config.INDEX_NAME, id=unique_id)
+        return response['found']
+    except:
+        return False
+
+def get_local_banned_links(client, thread_id):
+    """
+    Get all locally banned links in a specific thread.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        thread_id (str): The thread ID
+    
+    Returns:
+        list: List of banned link documents
+    """
+    try:
+        query = {
+            "bool": {
+                "must": [
+                    {"term": {"type.keyword": "banned_link"}},
+                    {"term": {"ban_type.keyword": "local"}},
+                    {"term": {"thread_id": thread_id}}
+                ]
+            }
+        }
+        resp = client.search(index=config.INDEX_NAME, query=query, size=500)
+        return [h['_source'] for h in resp['hits']['hits']]
+    except Exception as e:
+        print(f"[Database] Error getting local banned links: {e}")
+        return []
+
+def get_global_banned_links(client):
+    """
+    Get all globally banned links.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+    
+    Returns:
+        list: List of globally banned link documents
+    """
+    try:
+        query = {
+            "bool": {
+                "must": [
+                    {"term": {"type.keyword": "banned_link"}},
+                    {"term": {"ban_type.keyword": "global"}}
+                ]
+            }
+        }
+        resp = client.search(index=config.INDEX_NAME, query=query, size=500)
+        return [h['_source'] for h in resp['hits']['hits']]
+    except Exception as e:
+        print(f"[Database] Error getting global banned links: {e}")
+        return []
+
+def get_all_banned_links(client, thread_id):
+    """
+    Get all banned links (both local and global) for a specific thread.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client instance
+        thread_id (str): The thread ID
+    
+    Returns:
+        list: Combined list of locally and globally banned links
+    """
+    local_bans = get_local_banned_links(client, thread_id)
+    global_bans = get_global_banned_links(client)
+    return local_bans + global_bans

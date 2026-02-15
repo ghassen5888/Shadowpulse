@@ -2,6 +2,7 @@ import re
 import random
 import config
 import tor_network
+import database
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -182,7 +183,23 @@ def search_parallel(query, max_workers=8, progress_callback=None):
             unique_results[res['onion_url']] = res
     
     unique_list = list(unique_results.values())
-    print(f"📊 Total unique results: {len(unique_list)} (from {len(all_results)} duplicates)")
+    
+    # Filter out globally banned links
+    # Get the Elasticsearch client to check for global bans
+    try:
+        es_client = database.get_es_client()
+        if es_client:
+            filtered_list = []
+            for item in unique_list:
+                if not database.is_url_globally_banned(es_client, item['onion_url']):
+                    filtered_list.append(item)
+                else:
+                    print(f"   [Filtered] Globally banned link skipped: {item['onion_url']}")
+            unique_list = filtered_list
+    except Exception as e:
+        print(f"   [Warning] Could not filter globally banned links: {e}")
+    
+    print(f"📊 Total unique results after filtering: {len(unique_list)} (from {len(all_results)} duplicates)")
     
     # Final callback for 100% completion
     if progress_callback:
