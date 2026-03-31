@@ -7,7 +7,7 @@ intelligence data. It manages operations, links, and status tracking.
 """
 
 from elasticsearch import Elasticsearch
-import config
+from src.config import settings as config
 from datetime import datetime
 import uuid
 import os
@@ -51,7 +51,7 @@ def get_es_client(max_retries=5, sleep_seconds=2):
             if client.ping():
                 print("✅ DEBUG: Successfully connected to Elasticsearch!")
                 
-                # --- START FIX: Initialize Database with Schema ---
+                
                 if not client.indices.exists(index=config.INDEX_NAME):
                     print(f"🆕 Index '{config.INDEX_NAME}' not found. Creating with schema...")
                     
@@ -62,14 +62,14 @@ def get_es_client(max_retries=5, sleep_seconds=2):
                                 "url": {"type": "keyword"},
                                 "title": {"type": "text"},
                                 "content": {"type": "text"},
-                                "scraped_at": {"type": "date"},  # <--- THIS FIXES THE ERROR
+                                "scraped_at": {"type": "date"}, 
                                 "thread_id": {"type": "keyword"}
                             }
                         }
                     }
                     client.indices.create(index=config.INDEX_NAME, body=mapping)
                     print("✅ Index created successfully with correct mapping.")
-                # --- END FIX ---
+        
                 
                 return client
             else:
@@ -199,8 +199,7 @@ def get_thread_data(client, thread_id):
     """
     Retrieve all intel updates (discovered links) for a specific thread.
     """
-    # FIX: "thread_id" is already a keyword field, so we don't use .keyword
-    # "type" is likely auto-mapped as text, so .keyword is safe there.
+        # "type" is likely auto-mapped as text, so .keyword is safe there.
     query = {
         "bool": {
             "must": [

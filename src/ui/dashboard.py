@@ -1,13 +1,13 @@
 # dashboard.py
 import streamlit as st
 import pandas as pd
-import altair as alt  # Built-in with Streamlit
+import altair as alt  
 from datetime import datetime
 import time  
-import config
-import database
-import search_engine
-import tor_network
+from src.config import settings as config
+from src.database import database
+from src.core import search_engine
+from src.network import tor_network
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -37,7 +37,7 @@ if "current_page" not in st.session_state:
 
 # --- Title & Header ---
 st.title("🕵️‍♂️ Shadowpulse: Thread Intel")
-st.write(f"🔴 DEBUG: Current Thread ID is: {st.session_state.get('current_thread_id', 'None')}")  # <--- ADD THIS
+st.write(f" Current Thread ID is: {st.session_state.get('current_thread_id', 'None')}")  
 st.markdown("### Dark Web Threat Intelligence Scanner")
 st.divider()
 
@@ -155,6 +155,13 @@ def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10, 
 st.sidebar.header("📡 Mission Control")
 es_client = database.get_es_client()
 
+# DEBUG: Print session state
+print(f"[DEBUG] current_page={st.session_state.get('current_page')}")
+print(f"[DEBUG] current_thread_name={st.session_state.get('current_thread_name')}")
+print(f"[DEBUG] current_thread_id={st.session_state.get('current_thread_id')}")
+print(f"[DEBUG] es_client={es_client is not None}")
+print(f"[DEBUG] Condition for keywords: page=='thread'={st.session_state.get('current_page') == 'thread'}, thread_name={bool(st.session_state.get('current_thread_name'))}")
+
 with st.sidebar.form("create_thread_form"):
     new_thread_name = st.text_input("New Operation Name", placeholder="e.g. Op Red Sparrow")
     submitted = st.form_submit_button("Create Operation")
@@ -194,49 +201,15 @@ if es_client:
    st.sidebar.divider()
    
    # Banned Links Button
-   if st.sidebar.button("🚫 Banned Links", use_container_width=True):
+   if st.sidebar.button("🚫 Banned Links", width='stretch'):
        st.session_state["current_page"] = "banned_links"
        st.rerun()
    
    # Back to Thread Button (only shown if on banned_links page)
    if st.session_state["current_page"] == "banned_links":
-       if st.sidebar.button("← Back to Operation", use_container_width=True):
+       if st.sidebar.button("← Back to Operation", width='stretch'):
            st.session_state["current_page"] = "thread"
            st.rerun()
-   
-   st.sidebar.divider()
-   
-   # --- KEYWORDS SECTION IN SIDEBAR ---
-   if st.session_state["current_page"] == "thread" and st.session_state["current_thread_name"]:
-       st.sidebar.write("### 🏷️ Keywords")
-       keywords = database.get_thread_keywords(es_client, st.session_state["current_thread_id"])
-       
-       # Manual keyword input in sidebar
-       new_keyword = st.sidebar.text_input("Add Keyword", placeholder="Type keyword...", key="sidebar_keyword_input")
-       if st.sidebar.button("➕ Add", key="sidebar_add_keyword_btn", use_container_width=True):
-           if new_keyword.strip():
-               if database.add_keyword_to_thread(es_client, st.session_state["current_thread_id"], new_keyword):
-                   st.sidebar.success(f"✅ Added '{new_keyword}'")
-                   time.sleep(0.5)
-                   st.rerun()
-               else:
-                   st.sidebar.warning(f"⚠️ Already exists")
-           else:
-               st.sidebar.error("❌ Empty")
-       
-       # Display keywords in sidebar
-       if keywords:
-           st.sidebar.write(f"**{len(keywords)} keyword(s):**")
-           for keyword in keywords:
-               col1, col2 = st.sidebar.columns([3, 1])
-               with col1:
-                   st.write(f"🔹 {keyword}")
-               with col2:
-                   if st.button("🗑️", key=f"del_kw_sidebar_{keyword}", help="Delete"):
-                       database.remove_keyword_from_thread(es_client, st.session_state["current_thread_id"], keyword)
-                       st.rerun()
-       else:
-           st.sidebar.caption("No keywords yet.")
    
    st.sidebar.divider()
    st.sidebar.caption("System Status")
@@ -248,6 +221,44 @@ if es_client:
         st.sidebar.success("Tor Proxy: Active 🟢")
    else:
     st.sidebar.error("Tor Proxy: Disabled ")
+
+# --- KEYWORDS SECTION IN SIDEBAR (OUTSIDE es_client block) ---
+print(f"[DEBUG KEYWORDS] About to check keywords section")
+print(f"[DEBUG KEYWORDS] current_page == 'thread': {st.session_state['current_page'] == 'thread'}")
+print(f"[DEBUG KEYWORDS] current_thread_name: '{st.session_state['current_thread_name']}'")
+print(f"[DEBUG KEYWORDS] Both conditions: {st.session_state['current_page'] == 'thread' and st.session_state['current_thread_name']}")
+
+if st.session_state["current_page"] == "thread" and st.session_state["current_thread_name"]:
+   print(f"[DEBUG KEYWORDS] SHOWING KEYWORDS SECTION")
+   st.sidebar.write("### 🏷️ Keywords")
+   keywords = database.get_thread_keywords(es_client, st.session_state["current_thread_id"])
+   
+   # Manual keyword input in sidebar
+   new_keyword = st.sidebar.text_input("Add Keyword", placeholder="Type keyword...", key="sidebar_keyword_input")
+   if st.sidebar.button("➕ Add", key="sidebar_add_keyword_btn", width='stretch'):
+       if new_keyword.strip():
+           if database.add_keyword_to_thread(es_client, st.session_state["current_thread_id"], new_keyword):
+               st.sidebar.success(f"✅ Added '{new_keyword}'")
+               time.sleep(0.5)
+               st.rerun()
+           else:
+               st.sidebar.warning(f"⚠️ Already exists")
+       else:
+           st.sidebar.error("❌ Empty")
+   
+   # Display keywords in sidebar
+   if keywords:
+       st.sidebar.write(f"**{len(keywords)} keyword(s):**")
+       for keyword in keywords:
+           col1, col2 = st.sidebar.columns([3, 1])
+           with col1:
+               st.write(f"🔹 {keyword}")
+           with col2:
+               if st.button("🗑️", key=f"del_kw_sidebar_{keyword}", help="Delete"):
+                   database.remove_keyword_from_thread(es_client, st.session_state["current_thread_id"], keyword)
+                   st.rerun()
+   else:
+       st.sidebar.caption("No keywords yet.")
 
 
 #__main screen___
@@ -340,7 +351,7 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
 
         with stat_col2:
             st.write("")
-            if st.button("🔄 Check Link Status (Ping All)"):
+            if st.button("🔄 Check Link Status "):
                 # Create containers for progress display
                 progress_bar = st.progress(0)
                 status_text = st.empty()
@@ -409,12 +420,11 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                 # Status Tick Logic 
                 code = update.get('last_status_code', 0)
                 if code == 200:
-                    status_icon = "✅" # Green Tick
+                    status_icon = "✅" 
                 elif code == 0:
-                    status_icon = "⚪" # Grey circle (Unknown)
+                    status_icon = "⚪" 
                 else:
-                    status_icon = "❌" # Red Cross
-
+                    status_icon = "❌" 
                 st.markdown(f"**{status_icon} 🔗 {update.get('title', 'Unknown Site')}**")
                 st.caption(f"Source: `{update.get('onion_url')}` | Tags: {update.get('tags', [])}")
                 
@@ -427,7 +437,7 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                 
                 with c1:
                     if st.button("🕷 Deep Crawl", key=f"btn_{update.get('onion_url')}"):
-                        import crawler
+                        from src.core import crawler
                         with st.spinner("Accessing hidden service..."):
                             content = crawler.fetch_onion_content(update.get('onion_url'))
                             if content:

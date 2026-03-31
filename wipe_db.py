@@ -1,5 +1,5 @@
-import database
-import config
+from src.database import database
+from src.config import settings as config
 
 # Connect
 client = database.get_es_client()

@@ -47,6 +47,8 @@ services:
       # Point to Tor service instead of localhost
       - TOR_PROXY_IP=tor
       - TOR_PORT=9150
+      # Ensure PYTHONPATH is set in the container
+      - PYTHONPATH=/app:$PYTHONPATH
     ports:
       - "8501:8501"
     depends_on:
@@ -54,12 +56,8 @@ services:
         condition: service_healthy
       tor:
         condition: service_healthy
-    volumes:
-      # Mount current directory for live code changes during development
-      - .:/app
     networks:
       - shadowpulse-network
-    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
 
 volumes:
   elasticsearch_data:

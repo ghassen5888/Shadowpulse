@@ -1,6 +1,6 @@
 # tor_network.py
 import requests
-import config
+from src.config import settings as config
 import socks
 import socket
 import time

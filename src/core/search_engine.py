@@ -1,8 +1,8 @@
 import re
 import random
-import config
-import tor_network
-import database
+from src.config import settings as config
+from src.network import tor_network
+from src.database import database
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -206,4 +206,3 @@ def search_parallel(query, max_workers=8, progress_callback=None):
         progress_callback(total_engines, total_engines, "Deduplication complete")
     
     return unique_list
-

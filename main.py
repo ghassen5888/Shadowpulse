@@ -1,8 +1,8 @@
 # main.py
-import tor_network
-import database
-import search_engine
-import config
+from src.network import tor_network
+from src.database import database
+from src.core import search_engine
+from src.config import settings as config
 from datetime import datetime
 
 def main():

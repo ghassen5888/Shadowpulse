@@ -1,4 +1,4 @@
-import tor_network
+from src.network import tor_network
 from bs4 import BeautifulSoup
 import time
 
@@ -140,4 +140,3 @@ def fetch_onion_content_batch(urls, max_workers=5, timeout=15): # not yet in use
     failed_count = sum(1 for c in results.values() if c is None)
     print(f"[Crawler] Batch complete: {successful_count} successful, {failed_count} failed")
     return results
-

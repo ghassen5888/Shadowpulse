@@ -3,6 +3,9 @@ FROM python:3.10-slim
 # Set working directory
 WORKDIR /app
 
+# Set PYTHONPATH to ensure src package is discoverable
+ENV PYTHONPATH=/app:$PYTHONPATH
+
 # 🛠️ FIX 1: Install Tor, curl, and sed (sed handles line-ending fixes)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
@@ -42,3 +45,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 
 # 🛠️ FIX 4: Run the entrypoint script
 ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["streamlit", "run", "src/ui/dashboard.py"]
