@@ -680,3 +680,146 @@ def get_thread_keywords(client, thread_id):
     except Exception as e:
         print(f"[Database] Error getting thread keywords: {e}")
         return []
+
+
+# ============================================================================
+# TRUSTED SOURCES MANAGEMENT
+# ============================================================================
+
+def add_trusted_source(client, thread_id, url, title="No title", trust_score=0.0):
+    """
+    Add a link to the trusted sources list for an operation.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client
+        thread_id (str): Thread ID
+        url (str): URL of the trusted source
+        title (str): Human-readable title for this source
+        trust_score (float): Trust score between 0.0 and 1.0
+    
+    Returns:
+        bool: True if added successfully, False otherwise
+    """
+    try:
+        # Clamp trust score between 0 and 1
+        trust_score = max(0.0, min(1.0, float(trust_score)))
+        
+        doc = {
+            "type": "trusted_source",
+            "thread_id": thread_id,
+            "url": url,
+            "title": title,
+            "trust_score": trust_score,
+            "added_at": datetime.now().isoformat()
+        }
+        
+        client.index(
+            index=config.INDEX_NAME,
+            body=doc
+        )
+        print(f"[Trusted] Added trusted source: {url} with score {trust_score}")
+        return True
+    except Exception as e:
+        print(f"[Trusted] Error adding trusted source: {e}")
+        return False
+
+
+def get_trusted_sources(client, thread_id):
+    """
+    Get all trusted sources for a thread, sorted by trust score (highest first).
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client
+        thread_id (str): Thread ID
+    
+    Returns:
+        list: List of trusted source documents
+    """
+    try:
+        query = {
+            "bool": {
+                "must": [
+                    {"term": {"type.keyword": "trusted_source"}},
+                    {"term": {"thread_id": thread_id}}
+                ]
+            }
+        }
+        resp = client.search(
+            index=config.INDEX_NAME,
+            query=query,
+            size=500,
+            sort=[{"trust_score": {"order": "desc"}}]
+        )
+        
+        sources = []
+        for hit in resp['hits']['hits']:
+            source = hit['_source']
+            source['_id'] = hit['_id']
+            sources.append(source)
+        
+        return sources
+    except Exception as e:
+        print(f"[Trusted] Error getting trusted sources: {e}")
+        return []
+
+
+def update_trusted_source(client, source_id, title=None, trust_score=None):
+    """
+    Update a trusted source's title and/or trust score.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client
+        source_id (str): Document ID of the trusted source
+        title (str): New title (optional)
+        trust_score (float): New trust score 0-1 (optional)
+    
+    Returns:
+        bool: True if updated successfully
+    """
+    try:
+        update_body = {}
+        
+        if title is not None:
+            update_body["title"] = title
+        
+        if trust_score is not None:
+            # Clamp trust score between 0 and 1
+            trust_score = max(0.0, min(1.0, float(trust_score)))
+            update_body["trust_score"] = trust_score
+        
+        if not update_body:
+            return False
+        
+        client.update(
+            index=config.INDEX_NAME,
+            id=source_id,
+            body={"doc": update_body}
+        )
+        print(f"[Trusted] Updated trusted source {source_id}")
+        return True
+    except Exception as e:
+        print(f"[Trusted] Error updating trusted source: {e}")
+        return False
+
+
+def delete_trusted_source(client, source_id):
+    """
+    Delete a trusted source from the list.
+    
+    Args:
+        client (Elasticsearch): Elasticsearch client
+        source_id (str): Document ID of the trusted source
+    
+    Returns:
+        bool: True if deleted successfully
+    """
+    try:
+        client.delete(
+            index=config.INDEX_NAME,
+            id=source_id
+        )
+        print(f"[Trusted] Deleted trusted source {source_id}")
+        return True
+    except Exception as e:
+        print(f"[Trusted] Error deleting trusted source: {e}")
+        return False

@@ -268,6 +268,83 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
     st.subheader(f"📡 Operation: {st.session_state['current_thread_name']}")
     st.caption(f"Case ID: {st.session_state['current_thread_id']}")
     
+    # --- TRUSTED SOURCES SECTION ---
+    st.divider()
+    st.write("### ⭐ Trusted Sources")
+    
+    trusted_sources = database.get_trusted_sources(es_client, st.session_state["current_thread_id"])
+    
+    # Add new trusted source
+    with st.expander("➕ Add New Trusted Source"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            new_source_url = st.text_input("Source URL", placeholder="https://example.onion", key="new_source_url")
+        with col2:
+            new_source_title = st.text_input("Source Title", placeholder="E.g., Dark Web Forum", key="new_source_title")
+        with col3:
+            new_source_score = st.slider("Trust Score", 0.0, 1.0, 0.5, 0.1, key="new_source_score")
+        
+        if st.button("✅ Add to Trusted List", key="add_trusted_btn"):
+            if new_source_url.strip():
+                if database.add_trusted_source(
+                    es_client,
+                    st.session_state["current_thread_id"],
+                    new_source_url.strip(),
+                    new_source_title.strip() or "No title",
+                    new_source_score
+                ):
+                    st.success(f"✅ Added '{new_source_title}' to trusted sources")
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error("❌ Failed to add trusted source")
+            else:
+                st.error("❌ URL cannot be empty")
+    
+    # Display trusted sources
+    if trusted_sources:
+        for source in trusted_sources:
+            col1, col2, col3, col4, col5 = st.columns([2, 2, 1, 1, 0.5])
+            
+            with col1:
+                st.write(f"🔗 **{source.get('url', 'Unknown')}**")
+            
+            with col2:
+                # Editable title
+                new_title = st.text_input(
+                    "Title",
+                    value=source.get('title', 'No title'),
+                    key=f"edit_title_{source['_id']}"
+                )
+                if new_title != source.get('title', 'No title'):
+                    database.update_trusted_source(es_client, source['_id'], title=new_title)
+                    st.rerun()
+            
+            with col3:
+                # Editable trust score
+                new_score = st.slider(
+                    "Score",
+                    0.0, 1.0,
+                    value=float(source.get('trust_score', 0.0)),
+                    step=0.1,
+                    key=f"edit_score_{source['_id']}"
+                )
+                if abs(new_score - float(source.get('trust_score', 0.0))) > 0.01:
+                    database.update_trusted_source(es_client, source['_id'], trust_score=new_score)
+                    st.rerun()
+            
+            with col4:
+                st.write(f"⭐ {float(source.get('trust_score', 0.0)):.1f}")
+            
+            with col5:
+                if st.button("🗑️", key=f"del_trusted_{source['_id']}", help="Delete"):
+                    database.delete_trusted_source(es_client, source['_id'])
+                    st.rerun()
+    else:
+        st.info("ℹ️ No trusted sources added yet. Add one above!")
+    
+    st.divider()
+    
     col1, col2 = st.columns([3, 1])
     with col1:
         query = st.text_input("Add Intel (Search Term)", placeholder="Search keywords to add to this case...")
@@ -431,9 +508,9 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                 summary = update.get('summary', 'No summary.')
                 st.info(summary)
                 
-                # --- BAN BUTTONS SECTION ---
-                # Create three columns: one for Ban Locally, one for Ban Globally, one for Delete
-                c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
+                # --- ACTION BUTTONS SECTION ---
+                # Create columns for all action buttons
+                c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
                 
                 with c1:
                     if st.button("🕷 Deep Crawl", key=f"btn_{update.get('onion_url')}"):
@@ -455,9 +532,26 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                             else:
                                 st.error("Site unreachable.")
                 
+                # --- ADD TO TRUST BUTTON ---
+                # Adds the link to the trusted sources list
+                with c2:
+                    if st.button("⭐ Add to Trust", key=f"add_trust_{update.get('onion_url')}"):
+                        if database.add_trusted_source(
+                            es_client,
+                            st.session_state["current_thread_id"],
+                            update.get('onion_url'),
+                            title=update.get('title', 'No title'),
+                            trust_score=0.0
+                        ):
+                            st.success("✅ Added to trusted sources")
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.error("❌ Error adding to trust list")
+                
                 # --- BAN LOCALLY BUTTON ---
                 # Removes link from this thread and prevents it from appearing in future scans
-                with c2:
+                with c3:
                     if st.button("🚫 Ban Local", key=f"ban_local_{update.get('onion_url')}"):
                         try:
                             database.ban_link_locally(
@@ -478,7 +572,7 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                 
                 # --- BAN GLOBALLY BUTTON ---
                 # Removes link from all threads and prevents it from appearing in any future scans
-                with c3:
+                with c4:
                     if st.button("🛑 Ban Global", key=f"ban_global_{update.get('onion_url')}"):
                         try:
                             database.ban_link_globally(
@@ -496,7 +590,7 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                         except Exception as e:
                             st.error(f"❌ Error banning link: {e}")
                 
-                with c4:
+                with c5:
                     with st.expander("View Raw Data"):
                         st.code(update.get('full_content'))
                 
