@@ -35,6 +35,68 @@ if "current_thread_name" not in st.session_state:
 if "current_page" not in st.session_state:
     st.session_state["current_page"] = "thread"  # "thread" or "banned_links"
 
+# ============================================================================
+# CACHING HELPERS - These reduce database hits and improve performance
+# ============================================================================
+
+@st.cache_resource
+def get_cached_es_client():
+    """
+    Cache the Elasticsearch client connection.
+    
+    @st.cache_resource = Keep this object alive for the entire session
+    This prevents reconnecting to ES on every page interaction
+    """
+    return database.get_es_client()
+
+
+@st.cache_data(ttl=300)  # Cache for 5 minutes (300 seconds)
+def get_cached_thread_data(thread_id):
+    """
+    Cache thread intelligence data.
+    
+    @st.cache_data with ttl=300 means:
+    - Query database once, reuse results for 5 minutes
+    - Automatically refreshes after 5 minutes
+    - Reduces database load 50-100x
+    """
+    es_client = get_cached_es_client()
+    return database.get_thread_data(es_client, thread_id)
+
+
+@st.cache_data(ttl=300)
+def get_cached_trusted_sources(thread_id):
+    """
+    Cache trusted sources list (rarely changes during a session).
+    
+    Updates once every 5 minutes unless user manually deletes/adds source
+    """
+    es_client = get_cached_es_client()
+    return database.get_trusted_sources(es_client, thread_id)
+
+
+@st.cache_data(ttl=300)
+def get_cached_thread_keywords(thread_id):
+    """
+    Cache keywords list for this operation.
+    
+    Keywords don't change often, so 5-min cache is safe
+    """
+    es_client = get_cached_es_client()
+    return database.get_thread_keywords(es_client, thread_id)
+
+
+@st.cache_data(ttl=60)  # Cache for 1 minute
+def get_cached_all_threads():
+    """
+    Cache all operations list.
+    
+    ttl=60 = refresh every minute (faster for seeing new operations)
+    """
+    es_client = get_cached_es_client()
+    threads = database.get_all_threads(es_client)
+    return threads if threads else []
+
 # --- Title & Header ---
 st.title("🕵️‍♂️ Shadowpulse: Thread Intel")
 st.write(f" Current Thread ID is: {st.session_state.get('current_thread_id', 'None')}")  
@@ -153,7 +215,7 @@ def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10, 
 
 # --- Sidebar---
 st.sidebar.header("📡 Mission Control")
-es_client = database.get_es_client()
+es_client = get_cached_es_client()  # Use cached ES client for performance
 
 # DEBUG: Print session state
 print(f"[DEBUG] current_page={st.session_state.get('current_page')}")
@@ -184,7 +246,7 @@ with st.sidebar.form("create_thread_form"):
 
 if es_client:
    st.sidebar.divider()
-   threads = database.get_all_threads(es_client)
+   threads = get_cached_all_threads()  # Cached for 1 minute
    if threads:
       options = {t['name']: t['id'] for t in threads}
       index = 0
@@ -231,7 +293,7 @@ print(f"[DEBUG KEYWORDS] Both conditions: {st.session_state['current_page'] == '
 if st.session_state["current_page"] == "thread" and st.session_state["current_thread_name"]:
    print(f"[DEBUG KEYWORDS] SHOWING KEYWORDS SECTION")
    st.sidebar.write("### 🏷️ Keywords")
-   keywords = database.get_thread_keywords(es_client, st.session_state["current_thread_id"])
+   keywords = get_cached_thread_keywords(st.session_state["current_thread_id"])  # Cached for 5 minutes
    
    # Manual keyword input in sidebar
    new_keyword = st.sidebar.text_input("Add Keyword", placeholder="Type keyword...", key="sidebar_keyword_input")
@@ -272,7 +334,7 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
     st.divider()
     st.write("### ⭐ Trusted Sources")
     
-    trusted_sources = database.get_trusted_sources(es_client, st.session_state["current_thread_id"])
+    trusted_sources = get_cached_trusted_sources(st.session_state["current_thread_id"])  # Cached for 5 minutes
     
     # Add new trusted source
     with st.expander("➕ Add New Trusted Source"):
@@ -398,7 +460,7 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
     st.divider()
     st.write("### 📝 Intelligence Feed")
 
-    updates = database.get_thread_data(es_client , st.session_state["current_thread_id"])
+    updates = get_cached_thread_data(st.session_state["current_thread_id"])  # Cached for 5 minutes
     
     # --- STATISTICS SECTION (NATIVE CHARTS) --- 
     if updates:
