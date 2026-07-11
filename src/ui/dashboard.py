@@ -1,4 +1,5 @@
 # dashboard.py
+import math
 import streamlit as st
 import pandas as pd
 import altair as alt  
@@ -11,6 +12,9 @@ from src.network import tor_network
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+from src.core.telemetry import TelemetryBuffer, render_telemetry_panel
+from src.core.stix_exporter import export_stix_bundle_json
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -34,6 +38,34 @@ if "current_thread_name" not in st.session_state:
     st.session_state["current_thread_name"] = None
 if "current_page" not in st.session_state:
     st.session_state["current_page"] = "thread"  # "thread" or "banned_links"
+if "telemetry_buffer" not in st.session_state:
+    st.session_state["telemetry_buffer"] = TelemetryBuffer()
+if "scan_job_running" not in st.session_state:
+    st.session_state["scan_job_running"] = False
+if "scan_worker_thread" not in st.session_state:
+    st.session_state["scan_worker_thread"] = None
+if "scan_job_result" not in st.session_state:
+    st.session_state["scan_job_result"] = []
+if "scan_job_error" not in st.session_state:
+    st.session_state["scan_job_error"] = None
+if "scan_progress_completed" not in st.session_state:
+    st.session_state["scan_progress_completed"] = 0
+if "scan_progress_total" not in st.session_state:
+    st.session_state["scan_progress_total"] = 1
+if "scan_progress_label" not in st.session_state:
+    st.session_state["scan_progress_label"] = "Waiting"
+if "attached_results" not in st.session_state:
+    st.session_state["attached_results"] = []
+if "intel_page" not in st.session_state:
+    st.session_state["intel_page"] = 0
+if "intel_page_size" not in st.session_state:
+    st.session_state["intel_page_size"] = 20
+if "scan_requested" not in st.session_state:
+    st.session_state["scan_requested"] = False
+if "scan_query" not in st.session_state:
+    st.session_state["scan_query"] = ""
+if "scan_error" not in st.session_state:
+    st.session_state["scan_error"] = None
 
 # ============================================================================
 # CACHING HELPERS - These reduce database hits and improve performance
@@ -50,7 +82,7 @@ def get_cached_es_client():
     return database.get_es_client()
 
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes (300 seconds)
+@st.cache_data(ttl=30, show_spinner=False)
 def get_cached_thread_data(thread_id):
     """
     Cache thread intelligence data.
@@ -64,7 +96,7 @@ def get_cached_thread_data(thread_id):
     return database.get_thread_data(es_client, thread_id)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=30, show_spinner=False)
 def get_cached_trusted_sources(thread_id):
     """
     Cache trusted sources list (rarely changes during a session).
@@ -75,7 +107,7 @@ def get_cached_trusted_sources(thread_id):
     return database.get_trusted_sources(es_client, thread_id)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=30, show_spinner=False)
 def get_cached_thread_keywords(thread_id):
     """
     Cache keywords list for this operation.
@@ -86,7 +118,7 @@ def get_cached_thread_keywords(thread_id):
     return database.get_thread_keywords(es_client, thread_id)
 
 
-@st.cache_data(ttl=60)  # Cache for 1 minute
+@st.cache_data(ttl=30, show_spinner=False)
 def get_cached_all_threads():
     """
     Cache all operations list.
@@ -97,6 +129,136 @@ def get_cached_all_threads():
     threads = database.get_all_threads(es_client)
     return threads if threads else []
 
+
+def resolve_trust_status(update):
+    """Resolve a result row into the binary Trusted/Untrusted model."""
+    status = update.get("trust_status")
+    if status in {"Trusted", "Untrusted"}:
+        return status
+    return "Trusted" if update.get("is_trusted") else "Untrusted"
+
+
+def build_trusted_lookup(trusted_sources):
+    """Build a fast lookup set of trusted URLs for scan normalization."""
+    return {
+        str(source.get("url", "")).strip().lower()
+        for source in trusted_sources or []
+        if str(source.get("url", "")).strip()
+    }
+
+
+def append_attached_results(new_results):
+    """Append normalized scan results into session state without duplicating URLs."""
+    existing = list(st.session_state.get("attached_results", []))
+    seen = {item.get("onion_url") for item in existing if item.get("onion_url")}
+    for item in new_results or []:
+        url = item.get("onion_url")
+        if url and url not in seen:
+            existing.append(item)
+            seen.add(url)
+    st.session_state["attached_results"] = existing[-10:]
+    return st.session_state["attached_results"]
+
+
+def clear_dashboard_caches():
+    """Invalidate cached data after writes so UI reflects the latest state."""
+    get_cached_thread_data.clear()
+    get_cached_trusted_sources.clear()
+    get_cached_thread_keywords.clear()
+    get_cached_all_threads.clear()
+
+
+def initialize_scan_state():
+    """Ensure the scan workflow has thread-safe state buckets for progress and telemetry."""
+    st.session_state.setdefault("scan_job_running", False)
+    st.session_state.setdefault("scan_job_result", [])
+    st.session_state.setdefault("scan_job_error", None)
+    st.session_state.setdefault("scan_progress_completed", 0)
+    st.session_state.setdefault("scan_progress_total", 1)
+    st.session_state.setdefault("scan_progress_label", "Waiting")
+    st.session_state.setdefault("scan_progress_status", "Waiting")
+    st.session_state.setdefault("scan_progress_detail", "")
+    st.session_state.setdefault("scan_engine_statuses", {})
+    st.session_state.setdefault("scan_last_summary", "")
+    st.session_state.setdefault("attached_results", [])
+    st.session_state.setdefault("telemetry_buffer", TelemetryBuffer())
+    st.session_state.setdefault("scan_worker_thread", None)
+    st.session_state.setdefault("scan_requested", False)
+    st.session_state.setdefault("scan_query", "")
+    st.session_state.setdefault("scan_error", None)
+
+ctx = get_script_run_ctx()
+
+
+def update_scan_progress(completed, total, engine_name, status="Completed", detail="", payload_bytes=0, latency_ms=0.0):
+    """Publish progress updates from worker threads into Streamlit session state safely."""
+    if ctx:
+        add_script_run_ctx(threading.current_thread(), ctx)
+        completed = int(completed)
+        total = max(int(total), 1)
+        engine_name = str(engine_name or "engine")
+    statuses = dict(st.session_state.get("scan_engine_statuses", {}) or {})
+    statuses[engine_name] = {
+        "status": status,
+        "detail": detail or "",
+        "payload_bytes": int(payload_bytes or 0),
+        "latency_ms": float(latency_ms or 0.0),
+    }
+    
+    st.session_state["scan_progress_completed"] = completed
+    st.session_state["scan_progress_total"] = total
+    st.session_state["scan_progress_label"] = engine_name
+    st.session_state["scan_progress_status"] = status
+    st.session_state["scan_progress_detail"] = detail or ""
+    st.session_state["scan_engine_statuses"] = statuses
+
+
+def render_scan_status_panel():
+    """Render the live scan progress bar and engine status matrix."""
+    completed = st.session_state.get("scan_progress_completed", 0)
+    total = max(st.session_state.get("scan_progress_total", 1), 1)
+    progress_value = min(completed / total, 1.0)
+    detail = st.session_state.get("scan_progress_detail", "")
+    current_engine = st.session_state.get("scan_progress_label", "Waiting")
+
+    with st.container():
+        st.progress(progress_value)
+        st.caption(f"Progress: {completed}/{total} engines completed ({progress_value:.1%})")
+        st.caption(f"Current engine: {current_engine}")
+        if detail:
+            st.caption(detail)
+
+        engine_statuses = st.session_state.get("scan_engine_statuses", {}) or {}
+        if engine_statuses:
+            st.write("### Engine Matrix")
+            for engine, meta in list(engine_statuses.items())[-8:]:
+                icon = "✅" if meta.get("status") == "Completed" else "❌" if meta.get("status") == "Failed" else "⏳"
+                detail_text = meta.get("detail") or "Waiting"
+                st.write(f"{icon} {engine}: {meta.get('status', 'Pending')} — {detail_text}")
+        else:
+            st.info("Waiting for the first engine response...")
+
+    if st.session_state.get("scan_job_error"):
+        st.error(f"⚠️ Scan interrupted: {st.session_state['scan_job_error']}")
+    elif st.session_state.get("scan_job_result"):
+        st.success(f"✅ Search complete! Found {len(st.session_state['scan_job_result'])} unique leads")
+
+
+@st.fragment
+def render_scan_progress_fragment():
+    """Refresh the scan UI without re-entering the full app loop on every progress tick."""
+    if not st.session_state.get("scan_job_running"):
+        return
+
+    render_scan_status_panel()
+    if st.session_state.get("scan_worker_thread") and st.session_state["scan_worker_thread"].is_alive():
+        time.sleep(0.2)
+        st.rerun()
+
+
+initialize_scan_state()
+
+
 # --- Title & Header ---
 st.title("🕵️‍♂️ Shadowpulse: Thread Intel")
 st.write(f" Current Thread ID is: {st.session_state.get('current_thread_id', 'None')}")  
@@ -104,7 +266,7 @@ st.markdown("### Dark Web Threat Intelligence Scanner")
 st.divider()
 
 # --- Helper: Multithreaded Link Status Checker ---
-def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10, progress_callback=None):
+def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10, progress_callback=None, telemetry_callback=None):
     """
     Check the HTTP status of multiple onion links concurrently using ThreadPoolExecutor.
     
@@ -163,7 +325,13 @@ def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10, 
             # Use optimized make_request with strict 15-second timeout.
             # HEAD request is used instead of GET to avoid downloading full page content,
             # which would be wasteful when we only need to check if the server is alive.
-            response = tor_network.make_request(url, method='HEAD', timeout=15)
+            response = tor_network.make_request(
+                url,
+                method='HEAD',
+                timeout=15,
+                telemetry_callback=telemetry_callback,
+                engine_name=url,
+            )
             code = response.status_code if response else 500
         except Exception as e:
             print(f"[Status Check] Error on {url}: {e}")
@@ -239,7 +407,6 @@ with st.sidebar.form("create_thread_form"):
                 st.session_state["current_thread_id"] = tid
                 st.session_state["current_thread_name"] = tname
                 st.success(f"✅ Created: {tname}")
-                time.sleep(1)
                 st.rerun()
             except Exception as e:
                 st.error(f"Error creating thread: {e}")
@@ -301,7 +468,6 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
        if new_keyword.strip():
            if database.add_keyword_to_thread(es_client, st.session_state["current_thread_id"], new_keyword):
                st.sidebar.success(f"✅ Added '{new_keyword}'")
-               time.sleep(0.5)
                st.rerun()
            else:
                st.sidebar.warning(f"⚠️ Already exists")
@@ -327,338 +493,606 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
 
 # PAGE: THREAD INTELLIGENCE (Main Thread View)
 if st.session_state["current_page"] == "thread" and st.session_state["current_thread_name"]:
-    st.subheader(f"📡 Operation: {st.session_state['current_thread_name']}")
-    st.caption(f"Case ID: {st.session_state['current_thread_id']}")
-    
-    # --- TRUSTED SOURCES SECTION ---
-    st.divider()
-    st.write("### ⭐ Trusted Sources")
-    
-    trusted_sources = get_cached_trusted_sources(st.session_state["current_thread_id"])  # Cached for 5 minutes
-    
-    # Add new trusted source
-    with st.expander("➕ Add New Trusted Source"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            new_source_url = st.text_input("Source URL", placeholder="https://example.onion", key="new_source_url")
-        with col2:
-            new_source_title = st.text_input("Source Title", placeholder="E.g., Dark Web Forum", key="new_source_title")
-        with col3:
-            new_source_score = st.slider("Trust Score", 0.0, 1.0, 0.5, 0.1, key="new_source_score")
-        
-        if st.button("✅ Add to Trusted List", key="add_trusted_btn"):
-            if new_source_url.strip():
-                if database.add_trusted_source(
-                    es_client,
-                    st.session_state["current_thread_id"],
-                    new_source_url.strip(),
-                    new_source_title.strip() or "No title",
-                    new_source_score
-                ):
-                    st.success(f"✅ Added '{new_source_title}' to trusted sources")
-                    time.sleep(0.5)
-                    st.rerun()
-                else:
-                    st.error("❌ Failed to add trusted source")
-            else:
-                st.error("❌ URL cannot be empty")
-    
-    # Display trusted sources
-    if trusted_sources:
-        for source in trusted_sources:
-            col1, col2, col3, col4, col5 = st.columns([2, 2, 1, 1, 0.5])
-            
-            with col1:
-                st.write(f"🔗 **{source.get('url', 'Unknown')}**")
-            
-            with col2:
-                # Editable title
-                new_title = st.text_input(
-                    "Title",
-                    value=source.get('title', 'No title'),
-                    key=f"edit_title_{source['_id']}"
-                )
-                if new_title != source.get('title', 'No title'):
-                    database.update_trusted_source(es_client, source['_id'], title=new_title)
-                    st.rerun()
-            
-            with col3:
-                # Editable trust score
-                new_score = st.slider(
-                    "Score",
-                    0.0, 1.0,
-                    value=float(source.get('trust_score', 0.0)),
-                    step=0.1,
-                    key=f"edit_score_{source['_id']}"
-                )
-                if abs(new_score - float(source.get('trust_score', 0.0))) > 0.01:
-                    database.update_trusted_source(es_client, source['_id'], trust_score=new_score)
-                    st.rerun()
-            
-            with col4:
-                st.write(f"⭐ {float(source.get('trust_score', 0.0)):.1f}")
-            
-            with col5:
-                if st.button("🗑️", key=f"del_trusted_{source['_id']}", help="Delete"):
-                    database.delete_trusted_source(es_client, source['_id'])
-                    st.rerun()
-    else:
-        st.info("ℹ️ No trusted sources added yet. Add one above!")
-    
-    st.divider()
-    
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        query = st.text_input("Add Intel (Search Term)", placeholder="Search keywords to add to this case...")
-    with col2:
-        st.write("")
-        st.write("")
-        scan_btn = st.button("🔍 Scan & Attach", type="primary")
-    
-    if scan_btn and query:
-      # Create containers for progress display
-      progress_container = st.container()
-      progress_bar = progress_container.progress(0)
-      status_text = progress_container.empty()
-      results_placeholder = progress_container.empty()
-      
-      def update_progress(completed, total, engine_url):
-          """Callback function to update progress bar in real-time"""
-          progress_percent = completed / total
-          engine_name = engine_url.split('/')[2] if '/' in engine_url else engine_url
-          status_text.write(f"🔍 Searching... **{engine_name}** ✓ ({completed}/{total} engines)")
-          progress_bar.progress(progress_percent)
-      
-      results = search_engine.search_parallel(query, max_workers=8, progress_callback=update_progress)
+    if hasattr(st, "fragment"):
+        @st.fragment
+        def render_thread_view():
+            st.subheader(f"📡 Operation: {st.session_state['current_thread_name']}")
+            st.caption(f"Case ID: {st.session_state['current_thread_id']}")
 
-      if results:
-          # Clear progress display and show completion
-          progress_bar.progress(1.0)
-          status_text.success(f"✅ Search Complete! Found {len(results)} unique leads")
-          
-          # Save results to database
-          for item in results:
-              database.save_intel_update(
-                      es_client, 
-                      st.session_state["current_thread_id"], 
-                      item['onion_url'],
-                      item['title'],
-                      "Meta search result (Pending Crawl)", 
-                      tags=[query]
-                  )
-          
-          # Auto-add the search query as a keyword
-          database.add_keyword_to_thread(es_client, st.session_state["current_thread_id"], query)
-          
-          st.success(f"✅ Attached {len(results)} new leads to operation.")
-          time.sleep(1)
-          st.rerun()
-      else:
-          progress_bar.progress(0)
-          status_text.warning("⚠️ No new intelligence found.")
+            st.divider()
+            st.write("### ⭐ Trusted Sources")
 
-    st.divider()
-    st.write("### 📝 Intelligence Feed")
+            trusted_sources = get_cached_trusted_sources(st.session_state["current_thread_id"])
 
-    updates = get_cached_thread_data(st.session_state["current_thread_id"])  # Cached for 5 minutes
-    
-    # --- STATISTICS SECTION (NATIVE CHARTS) --- 
-    if updates:
-        active_count = sum(1 for u in updates if u.get('last_status_code') == 200)
-        dead_count = len(updates) - active_count
-        
-        stat_col1, stat_col2 = st.columns([1, 2])
-        
-        with stat_col1:
-             st.caption("Link Health Overview")
-             # Create simple dataframe for chart
-             source = pd.DataFrame({
-                 "Status": ["Active", "Down"],
-                 "Count": [active_count, dead_count],
-                 "Color": ["green", "red"] 
-             })
-             
-             # Altair Pie Chart (Built-in to Streamlit)
-             base = alt.Chart(source).encode(
-                theta=alt.Theta("Count", stack=True)
-             )
-             pie = base.mark_arc(outerRadius=80).encode(
-                color=alt.Color("Status", scale=alt.Scale(domain=["Active", "Down"], range=["green", "red"])),
-                tooltip=["Status", "Count"]
-             )
-             st.altair_chart(pie, use_container_width=True)
+            with st.expander("➕ Add New Trusted Source"):
+                col1, col2 = st.columns([2, 2])
+                with col1:
+                    st.text_input("Source URL", placeholder="https://example.onion", key="new_source_url")
+                with col2:
+                    st.text_input("Source Title", placeholder="E.g., Dark Web Forum", key="new_source_title")
 
-        with stat_col2:
-            st.write("")
-            if st.button("🔄 Check Link Status "):
-                # Create containers for progress display
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                results_text = st.empty()
-                
-                def update_progress(completed, total, url, code):
-                    """Callback function to update progress bar in real-time"""
-                    # Clamp progress percent to [0.0, 1.0] to prevent Streamlit API errors
-                    progress_percent = min(completed / total, 1.0)
-                    status_icon = "✅" if code == 200 else "❌"
-                    # Handle None URL gracefully
-                    if url and url != "error":
-                        url_display = url.split('/')[-1][:40]
-                    else:
-                        url_display = "error" if url == "error" else "unknown"
-                    status_text.write(f"🔍 Pinging... **{url_display}** {status_icon} ({completed}/{total} checked)")
-                    progress_bar.progress(progress_percent)
-                
-                # Run concurrent status check with progress callback
-                results = check_link_status_concurrent(
-                    updates, 
-                    es_client, 
-                    st.session_state["current_thread_id"],
-                    max_workers=10,
-                    progress_callback=update_progress
-                )
-                
-                # Show summary
-                alive = sum(1 for _, code in results if code == 200)
-                dead = len(results) - alive
-                
-                progress_bar.progress(1.0)
-                status_text.success(f"✅ Status check complete!")
-                results_text.info(f"📊 Results: **{alive}** active 🟢 | **{dead}** down 🔴")
-                
-                time.sleep(1)
-                st.rerun()
-            
-            # --- DELETE ALL DEAD LINKS BUTTON ---
-            # Displays "Delete All Dead Links" button to remove all links with status code != 200
-            if st.button("🗑️ Delete All Dead Links", key="delete_all_dead"):
-                # Filter for dead links (status code not 200 or 0)
-                dead_links = [u for u in updates if u.get('last_status_code') not in [200, 0]]
-                
-                if dead_links:
-                    # Delete each dead link from the database
-                    for link in dead_links:
-                        try:
-                            database.delete_intel_update(
-                                es_client, 
-                                st.session_state["current_thread_id"], 
-                                link.get('onion_url')
-                            )
-                        except Exception as e:
-                            print(f"Error deleting {link.get('onion_url')}: {e}")
-                    
-                    st.success(f"✅ Deleted {len(dead_links)} dead links")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.info("ℹ️ No dead links to delete. All links are either active or untested.")
-
-    if updates :
-        for update in updates:
-           with st.container():
-                # Status Tick Logic 
-                code = update.get('last_status_code', 0)
-                if code == 200:
-                    status_icon = "✅" 
-                elif code == 0:
-                    status_icon = "⚪" 
-                else:
-                    status_icon = "❌" 
-                st.markdown(f"**{status_icon} 🔗 {update.get('title', 'Unknown Site')}**")
-                st.caption(f"Source: `{update.get('onion_url')}` | Tags: {update.get('tags', [])}")
-                
-                summary = update.get('summary', 'No summary.')
-                st.info(summary)
-                
-                # --- ACTION BUTTONS SECTION ---
-                # Create columns for all action buttons
-                c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
-                
-                with c1:
-                    if st.button("🕷 Deep Crawl", key=f"btn_{update.get('onion_url')}"):
-                        from src.core import crawler
-                        with st.spinner("Accessing hidden service..."):
-                            content = crawler.fetch_onion_content(update.get('onion_url'))
-                            if content:
-                                    database.save_intel_update(
-                                    es_client,
-                                    st.session_state["current_thread_id"],
-                                    update.get('onion_url'),
-                                    update.get('title'),
-                                    content,
-                                    tags=update.get('tags', []),
-                                    last_status_code=200
-                                )
-                                    st.success("Extracted!")
-                                    st.rerun()
-                            else:
-                                st.error("Site unreachable.")
-                
-                # --- ADD TO TRUST BUTTON ---
-                # Adds the link to the trusted sources list
-                with c2:
-                    if st.button("⭐ Add to Trust", key=f"add_trust_{update.get('onion_url')}"):
+                if st.button("✅ Add to Trusted List", key="add_trusted_btn"):
+                    source_url = (st.session_state.get("new_source_url") or "").strip()
+                    source_title = (st.session_state.get("new_source_title") or "").strip()
+                    if source_url:
                         if database.add_trusted_source(
                             es_client,
                             st.session_state["current_thread_id"],
-                            update.get('onion_url'),
-                            title=update.get('title', 'No title'),
-                            trust_score=0.0
+                            source_url,
+                            source_title or "No title"
                         ):
-                            st.success("✅ Added to trusted sources")
-                            time.sleep(0.5)
+                            clear_dashboard_caches()
+                            st.session_state["new_source_url"] = ""
+                            st.session_state["new_source_title"] = ""
+                            st.toast(f"✅ Added '{source_url}' to the trusted list")
                             st.rerun()
                         else:
-                            st.error("❌ Error adding to trust list")
-                
-                # --- BAN LOCALLY BUTTON ---
-                # Removes link from this thread and prevents it from appearing in future scans
-                with c3:
-                    if st.button("🚫 Ban Local", key=f"ban_local_{update.get('onion_url')}"):
-                        try:
-                            database.ban_link_locally(
+                            st.error("❌ Failed to add trusted source")
+                    else:
+                        st.error("❌ URL cannot be empty")
+
+            if trusted_sources:
+                for source in trusted_sources:
+                    col1, col2, col3 = st.columns([3, 2, 1])
+                    with col1:
+                        st.write(f"🔗 **{source.get('url', 'Unknown')}**")
+                    with col2:
+                        new_title = st.text_input(
+                            "Title",
+                            value=source.get('title', 'No title'),
+                            key=f"edit_title_{source['_id']}"
+                        )
+                        if new_title != source.get('title', 'No title'):
+                            database.update_trusted_source(es_client, source['_id'], title=new_title)
+                            clear_dashboard_caches()
+                            st.rerun()
+                    with col3:
+                        st.write("✅ Trusted")
+                        if st.button("🗑️", key=f"del_trusted_{source['_id']}", help="Delete"):
+                            database.delete_trusted_source(es_client, source['_id'])
+                            clear_dashboard_caches()
+                            st.rerun()
+            else:
+                st.info("ℹ️ No trusted sources added yet. Add one above!")
+
+            st.divider()
+
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                query = st.text_input("Add Intel (Search Term)", placeholder="Search keywords to add to this case...", key="intel_query")
+            with col2:
+                st.write("")
+                st.write("")
+                scan_btn = st.button("🔍 Scan & Attach", type="primary")
+
+            if st.session_state.get("scan_job_running"):
+                render_scan_progress_fragment()
+                render_telemetry_panel(
+                    st.session_state["telemetry_buffer"],
+                    st.container().empty(),
+                    st.container().empty(),
+                )
+
+                if st.session_state.get("scan_job_error"):
+                    st.error(f"⚠️ Scan interrupted: {st.session_state['scan_job_error']}")
+                elif st.session_state.get("scan_job_result"):
+                    results = st.session_state["scan_job_result"]
+                    for item in results:
+                        database.save_intel_update(
+                            es_client,
+                            st.session_state["current_thread_id"],
+                            item.get('onion_url', ''),
+                            item.get('title', 'Untitled'),
+                            item.get('summary', 'Meta search result (Pending Crawl)'),
+                            tags=[query],
+                            trust_status=item.get('trust_status', 'Untrusted'),
+                        )
+                    database.add_keyword_to_thread(es_client, st.session_state["current_thread_id"], query)
+                    clear_dashboard_caches()
+                    st.success(f"✅ Attached {len(results)} new leads to operation.")
+                else:
+                    st.warning("⚠️ No new intelligence found.")
+
+            if scan_btn and query:
+                    # --- 1. UI Placeholders (Ensures progress bar stays visible) ---
+                    progress_container = st.container()
+                    status_text = progress_container.empty()
+                    progress_bar = progress_container.progress(0)
+                    
+                    # --- 2. Thread Context & Callbacks ---
+                    ctx = get_script_run_ctx()
+
+                    def update_scan_progress(completed_count, total_engines, engine_name, status, detail, latency, payload):
+                        # Inject context into the ThreadPoolExecutor workers
+                        if ctx: add_script_run_ctx(threading.current_thread(), ctx)
+                        progress_percent = completed_count / total_engines if total_engines > 0 else 0
+                        status_text.write(f"🔍 Searching... {engine_name} ({completed_count}/{total_engines} engines checked)")
+                        progress_bar.progress(progress_percent)
+
+                    def telemetry_callback(engine, phase, latency_ms, payload_bytes, status_icon, detail=""):
+                        if ctx: add_script_run_ctx(threading.current_thread(), ctx)
+                        if "telemetry_buffer" in st.session_state:
+                            st.session_state["telemetry_buffer"].push({
+                                "engine": engine,
+                                "phase": phase,
+                                "latency_ms": latency_ms,
+                                "payload_bytes": payload_bytes,
+                                "status_icon": status_icon,
+                                "detail": detail,
+                            })
+                    
+                    # --- 3. Trust List Preparation ---
+                    trusted_sources = get_cached_trusted_sources(st.session_state["current_thread_id"])
+                    trusted_lookup = build_trusted_lookup(trusted_sources)
+                    
+                    # --- 4. EXECUTE SCAN (No complicated background threads needed!) ---
+                    with st.spinner("Executing parallel dark web search..."):
+                        raw_results = search_engine.search_parallel(
+                            query,
+                            max_workers=8,
+                            progress_callback=update_scan_progress,
+                            telemetry_callback=telemetry_callback,
+                        )
+                    
+                    # --- 5. ATTACH TO DATABASE ---
+                    if raw_results:
+                        normalized_results = []
+                        for item in raw_results:
+                            normalized = database.normalize_scan_result(item, trusted_lookup)
+                            if normalized:
+                                normalized_results.append(normalized)
+                        
+                        # 🚨 EXPLICITLY SAVE TO ELASTICSEARCH (Guarantees they attach!)
+                        for item in normalized_results:
+                            database.save_intel_update(
                                 es_client, 
                                 st.session_state["current_thread_id"], 
-                                update.get('onion_url')
+                                item.get('onion_url', ''),
+                                item.get('title', 'Unknown Title'),
+                                "Meta search result (Pending Crawl)", 
+                                tags=[query]
                             )
-                            database.delete_intel_update(
-                                es_client, 
-                                st.session_state["current_thread_id"], 
-                                update.get('onion_url')
-                            )
-                            st.success("✅ Locally banned & removed")
-                            time.sleep(0.5)
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ Error banning link: {e}")
-                
-                # --- BAN GLOBALLY BUTTON ---
-                # Removes link from all threads and prevents it from appearing in any future scans
-                with c4:
-                    if st.button("🛑 Ban Global", key=f"ban_global_{update.get('onion_url')}"):
+                            
+                        # If you had a custom UI attach function, safely attempt it
                         try:
-                            database.ban_link_globally(
-                                es_client, 
-                                update.get('onion_url')
-                            )
-                            # Delete from ALL threads
-                            deleted_count = database.delete_link_from_all_threads(
-                                es_client,
-                                update.get('onion_url')
-                            )
-                            st.success(f"✅ Globally banned & removed from {deleted_count} thread(s)")
-                            time.sleep(0.5)
+                            append_attached_results(normalized_results)
+                        except NameError:
+                            pass
+                        
+                        progress_bar.progress(1.0)
+                        status_text.success(f"✅ Search Complete! Successfully attached {len(normalized_results)} new links!")
+                        
+                        # PAUSE for 2 seconds so you can actually read the success message before it reloads!
+                        time.sleep(2) 
+                        st.rerun()
+                    else:
+                        progress_bar.progress(0)
+                        status_text.warning("⚠️ No new intelligence found.")
+
+            st.divider()
+            st.write("### 📝 Intelligence Feed")
+
+            updates = get_cached_thread_data(st.session_state["current_thread_id"])
+
+            if st.session_state.get("attached_results"):
+                with st.expander("🧾 Recently Attached Intel", expanded=False):
+                    for item in st.session_state["attached_results"][-5:]:
+                        st.write(f"• {item.get('title', 'Untitled')} — {item.get('onion_url', 'unknown')} ({item.get('trust_status', 'Untrusted')})")
+
+            st.download_button(
+                label="📦 Export STIX 2.1 Bundle",
+                data=export_stix_bundle_json(
+                    [
+                        {
+                            "onion_url": update.get("onion_url"),
+                            "title": update.get("title", "Unknown"),
+                            "source": update.get("source", "shadowpulse"),
+                            "latency_ms": update.get("latency_ms", 0.0),
+                            "http_status": update.get("last_status_code", 0),
+                            "payload_bytes": update.get("payload_bytes", 0),
+                            "crawled_at": update.get("scraped_at") or update.get("crawled_at") or datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "summary": update.get("summary", "No summary available"),
+                            "trust_status": resolve_trust_status(update),
+                        }
+                        for update in updates if update.get("onion_url")
+                    ],
+                    thread_id=str(st.session_state.get("current_thread_id", "shadowpulse")),
+                    thread_name=str(st.session_state.get("current_thread_name", "Shadowpulse")),
+                    trusted_sources=[{"url": source.get("url"), "title": source.get("title")} for source in trusted_sources],
+                ),
+                file_name="shadowpulse_threat_intel_stix21.json",
+                mime="application/json",
+                disabled=not updates,
+            )
+
+            if updates:
+                active_count = sum(1 for u in updates if u.get('last_status_code') == 200)
+                dead_count = len(updates) - active_count
+                stat_col1, stat_col2 = st.columns([1, 2])
+                with stat_col1:
+                    st.caption("Link Health Overview")
+                    source = pd.DataFrame({
+                        "Status": ["Active", "Down"],
+                        "Count": [active_count, dead_count],
+                        "Color": ["green", "red"]
+                    })
+                    base = alt.Chart(source).encode(theta=alt.Theta("Count", stack=True))
+                    pie = base.mark_arc(outerRadius=80).encode(
+                        color=alt.Color("Status", scale=alt.Scale(domain=["Active", "Down"], range=["green", "red"])),
+                        tooltip=["Status", "Count"]
+                    )
+                    st.altair_chart(pie, width="stretch")
+
+                with stat_col2:
+                    st.write("")
+                    if st.button("🔄 Check Link Status"):
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        results_text = st.empty()
+
+                        def update_progress(completed, total, url, code):
+                            progress_percent = min(completed / total, 1.0)
+                            status_icon = "✅" if code == 200 else "❌"
+                            url_display = url.split('/')[-1][:40] if url and url != "error" else ("error" if url == "error" else "unknown")
+                            status_text.write(f"🔍 Pinging... **{url_display}** {status_icon} ({completed}/{total} checked)")
+                            progress_bar.progress(progress_percent)
+
+                        results = check_link_status_concurrent(
+                            updates,
+                            es_client,
+                            st.session_state["current_thread_id"],
+                            max_workers=10,
+                            progress_callback=update_progress
+                        )
+
+                        alive = sum(1 for _, code in results if code == 200)
+                        dead = len(results) - alive
+                        progress_bar.progress(1.0)
+                        status_text.success("✅ Status check complete!")
+                        results_text.info(f"📊 Results: **{alive}** active 🟢 | **{dead}** down 🔴")
+                        clear_dashboard_caches()
+                        st.rerun()
+
+                    if st.button("🗑️ Delete All Dead Links", key="delete_all_dead"):
+                        dead_links = [u for u in updates if u.get('last_status_code') not in [200, 0]]
+                        if dead_links:
+                            for link in dead_links:
+                                try:
+                                    database.delete_intel_update(es_client, st.session_state["current_thread_id"], link.get('onion_url'))
+                                except Exception as exc:
+                                    print(f"Error deleting {link.get('onion_url')}: {exc}")
+                            st.success(f"✅ Deleted {len(dead_links)} dead links")
+                            clear_dashboard_caches()
                             st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ Error banning link: {e}")
-                
-                with c5:
-                    with st.expander("View Raw Data"):
-                        st.code(update.get('full_content'))
-                
-                st.markdown("---")
+                        else:
+                            st.info("ℹ️ No dead links to delete. All links are either active or untested.")
+
+            if updates:
+                total_pages = max(1, math.ceil(len(updates) / st.session_state["intel_page_size"]))
+                page = min(st.session_state["intel_page"], total_pages - 1)
+                visible_updates = updates[page * st.session_state["intel_page_size"]:(page + 1) * st.session_state["intel_page_size"]]
+                nav_col1, nav_col2 = st.columns([1, 1])
+                with nav_col1:
+                    if st.button("⬅️ Prev", disabled=page <= 0):
+                        st.session_state["intel_page"] = max(0, page - 1)
+                        st.rerun()
+                with nav_col2:
+                    if st.button("Next ➡️", disabled=page >= total_pages - 1):
+                        st.session_state["intel_page"] = min(total_pages - 1, page + 1)
+                        st.rerun()
+                st.caption(f"Showing page {page + 1} of {total_pages}")
+                for update in visible_updates:
+                    with st.container():
+                        code = update.get('last_status_code', 0)
+                        status_icon = "✅" if code == 200 else ("⚪" if code == 0 else "❌")
+                        st.markdown(f"**{status_icon} 🔗 {update.get('title', 'Unknown Site')}**")
+                        st.caption(f"Source: `{update.get('onion_url')}` | Tags: {update.get('tags', [])}")
+                        summary = update.get('summary', 'No summary.')
+                        st.info(summary)
+
+                        c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
+                        with c1:
+                            if st.button("🕷 Deep Crawl", key=f"btn_{update.get('onion_url')}"):
+                                from src.core import crawler
+                                with st.spinner("Accessing hidden service..."):
+                                    content = crawler.fetch_onion_content(update.get('onion_url'))
+                                    if content:
+                                        database.save_intel_update(
+                                            es_client,
+                                            st.session_state["current_thread_id"],
+                                            update.get('onion_url'),
+                                            update.get('title'),
+                                            content,
+                                            tags=update.get('tags', []),
+                                            last_status_code=200
+                                        )
+                                        clear_dashboard_caches()
+                                        st.success("Extracted!")
+                                        st.rerun()
+                                    else:
+                                        st.error("Site unreachable.")
+
+                        with c2:
+                            if st.button("⭐ Add to Trust", key=f"add_trust_{update.get('onion_url')}"):
+                                url = update.get('onion_url')
+                                title = update.get('title', 'No title')
+                                if database.add_trusted_source(es_client, st.session_state["current_thread_id"], url, title=title):
+                                    clear_dashboard_caches()
+                                    st.toast(f"✅ Added '{url}' to the trusted list")
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Error adding to trust list")
+
+                        with c3:
+                            if st.button("🚫 Ban Local", key=f"ban_local_{update.get('onion_url')}"):
+                                try:
+                                    database.ban_link_locally(es_client, st.session_state["current_thread_id"], update.get('onion_url'))
+                                    database.delete_intel_update(es_client, st.session_state["current_thread_id"], update.get('onion_url'))
+                                    clear_dashboard_caches()
+                                    st.success("✅ Locally banned & removed")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"❌ Error banning link: {exc}")
+
+                        with c4:
+                            if st.button("🛑 Ban Global", key=f"ban_global_{update.get('onion_url')}"):
+                                try:
+                                    database.ban_link_globally(es_client, update.get('onion_url'))
+                                    deleted_count = database.delete_link_from_all_threads(es_client, update.get('onion_url'))
+                                    clear_dashboard_caches()
+                                    st.success(f"✅ Globally banned & removed from {deleted_count} thread(s)")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"❌ Error banning link: {exc}")
+
+                        with c5:
+                            with st.expander("View Raw Data"):
+                                st.code(update.get('full_content'))
+
+                        st.markdown("---")
+            else:
+                st.info("No intelligence gathered for this operation yet. Run a scan above.")
+
+        render_thread_view()
     else:
-       st.info("No intelligence gathered for this operation yet. Run a scan above.")
+        # Fallback for older Streamlit builds.
+        st.subheader(f"📡 Operation: {st.session_state['current_thread_name']}")
+        st.caption(f"Case ID: {st.session_state['current_thread_id']}")
+        st.divider()
+        st.write("### ⭐ Trusted Sources")
+        trusted_sources = get_cached_trusted_sources(st.session_state["current_thread_id"])
+        with st.expander("➕ Add New Trusted Source"):
+            col1, col2 = st.columns([2, 2])
+            with col1:
+                new_source_url = st.text_input("Source URL", placeholder="https://example.onion", key="new_source_url")
+            with col2:
+                new_source_title = st.text_input("Source Title", placeholder="E.g., Dark Web Forum", key="new_source_title")
+            if st.button("✅ Add to Trusted List", key="add_trusted_btn"):
+                source_url = (st.session_state.get("new_source_url") or "").strip()
+                source_title = (st.session_state.get("new_source_title") or "").strip()
+                if source_url:
+                    if database.add_trusted_source(es_client, st.session_state["current_thread_id"], source_url, source_title or "No title"):
+                        clear_dashboard_caches()
+                        st.session_state["new_source_url"] = ""
+                        st.session_state["new_source_title"] = ""
+                        st.toast(f"✅ Added '{source_url}' to the trusted list")
+                        st.rerun()
+                    else:
+                        st.error("❌ Failed to add trusted source")
+                else:
+                    st.error("❌ URL cannot be empty")
+        if trusted_sources:
+            for source in trusted_sources:
+                col1, col2, col3 = st.columns([3, 2, 1])
+                with col1:
+                    st.write(f"🔗 **{source.get('url', 'Unknown')}**")
+                with col2:
+                    new_title = st.text_input("Title", value=source.get('title', 'No title'), key=f"edit_title_{source['_id']}")
+                    if new_title != source.get('title', 'No title'):
+                        database.update_trusted_source(es_client, source['_id'], title=new_title)
+                        clear_dashboard_caches()
+                        st.rerun()
+                with col3:
+                    st.write("✅ Trusted")
+                    if st.button("🗑️", key=f"del_trusted_{source['_id']}", help="Delete"):
+                        database.delete_trusted_source(es_client, source['_id'])
+                        clear_dashboard_caches()
+                        st.rerun()
+        else:
+            st.info("ℹ️ No trusted sources added yet. Add one above!")
+        st.divider()
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            query = st.text_input("Add Intel (Search Term)", placeholder="Search keywords to add to this case...", key="intel_query")
+        with col2:
+            st.write("")
+            st.write("")
+            scan_btn = st.button("🔍 Scan & Attach", type="primary")
+        if st.session_state.get("scan_job_running"):
+            render_scan_progress_fragment()
+            render_telemetry_panel(st.session_state["telemetry_buffer"], st.container().empty(), st.container().empty())
+            if st.session_state.get("scan_job_error"):
+                st.error(f"⚠️ Scan interrupted: {st.session_state['scan_job_error']}")
+            elif st.session_state.get("scan_job_result"):
+                results = st.session_state["scan_job_result"]
+                for item in results:
+                    database.save_intel_update(es_client, st.session_state["current_thread_id"], item.get('onion_url', ''), item.get('title', 'Untitled'), item.get('summary', 'Meta search result (Pending Crawl)'), tags=[query], trust_status=item.get('trust_status', 'Untrusted'))
+                database.add_keyword_to_thread(es_client, st.session_state["current_thread_id"], query)
+                clear_dashboard_caches()
+                st.success(f"✅ Attached {len(results)} new leads to operation.")
+            else:
+                st.warning("⚠️ No new intelligence found.")
+        if scan_btn and query:
+            if st.session_state.get("scan_job_running"):
+                st.warning("A scan is already running. Please wait for it to finish.")
+            else:
+                st.session_state["scan_job_running"] = True
+                st.session_state["scan_job_error"] = None
+                st.session_state["scan_job_result"] = []
+                st.session_state["scan_progress_completed"] = 0
+                st.session_state["scan_progress_total"] = len(config.SEARCH_ENGINES or []) or 1
+                st.session_state["scan_progress_label"] = "Bootstrapping"
+                st.session_state["scan_progress_status"] = "Queued"
+                st.session_state["scan_progress_detail"] = "Preparing engines"
+                st.session_state["scan_engine_statuses"] = {}
+                st.session_state["telemetry_buffer"].clear()
+                def update_progress(completed, total, engine_url, status="Completed", detail="", payload_bytes=0, latency_ms=0.0):
+                    st.session_state["scan_progress_completed"] = int(completed)
+                    st.session_state["scan_progress_total"] = max(int(total), 1)
+                    engine_name = str(engine_url or "engine")
+                    st.session_state["scan_progress_label"] = engine_name
+                    st.session_state["scan_progress_status"] = status
+                    st.session_state["scan_progress_detail"] = detail or ""
+                    statuses = dict(st.session_state.get("scan_engine_statuses", {}) or {})
+                    statuses[engine_name] = {"status": status, "detail": detail or "", "payload_bytes": int(payload_bytes or 0), "latency_ms": float(latency_ms or 0.0)}
+                    st.session_state["scan_engine_statuses"] = statuses
+                def telemetry_callback(engine, phase, latency_ms, payload_bytes, status_icon, detail=""):
+                    st.session_state["telemetry_buffer"].push({"engine": engine, "phase": phase, "latency_ms": latency_ms, "payload_bytes": payload_bytes, "status_icon": status_icon, "detail": detail})
+                trusted_sources = get_cached_trusted_sources(st.session_state["current_thread_id"])
+                trusted_lookup = build_trusted_lookup(trusted_sources)
+                def run_scan_worker():
+                    try:
+                        raw_results = search_engine.search_parallel(query, max_workers=min(8, max(2, len(config.SEARCH_ENGINES or []))), progress_callback=update_progress, telemetry_callback=telemetry_callback)
+                        normalized_results = []
+                        for item in raw_results or []:
+                            normalized = database.normalize_scan_result(item, trusted_lookup)
+                            if normalized:
+                                normalized_results.append(normalized)
+                        st.session_state["scan_job_result"] = normalized_results
+                        append_attached_results(normalized_results)
+                    except Exception as exc:
+                        st.session_state["scan_job_error"] = str(exc)
+                        st.session_state["scan_job_result"] = []
+                    finally:
+                        st.session_state["scan_job_running"] = False
+                        st.session_state["scan_progress_status"] = "Completed" if not st.session_state.get("scan_job_error") else "Failed"
+                        st.session_state["scan_progress_detail"] = "Scan cycle complete"
+                        st.session_state["scan_pending_completion"] = True
+                worker = threading.Thread(target=run_scan_worker, daemon=True)
+                st.session_state["scan_worker_thread"] = worker
+                worker.start()
+                st.rerun()
+        st.divider()
+        st.write("### 📝 Intelligence Feed")
+        updates = get_cached_thread_data(st.session_state["current_thread_id"])
+        if st.session_state.get("attached_results"):
+            with st.expander("🧾 Recently Attached Intel", expanded=False):
+                for item in st.session_state["attached_results"][-5:]:
+                    st.write(f"• {item.get('title', 'Untitled')} — {item.get('onion_url', 'unknown')} ({item.get('trust_status', 'Untrusted')})")
+        st.download_button(label="📦 Export STIX 2.1 Bundle", data=export_stix_bundle_json([{"onion_url": update.get("onion_url"), "title": update.get("title", "Unknown"), "source": update.get("source", "shadowpulse"), "latency_ms": update.get("latency_ms", 0.0), "http_status": update.get("last_status_code", 0), "payload_bytes": update.get("payload_bytes", 0), "crawled_at": update.get("scraped_at") or update.get("crawled_at") or datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"), "summary": update.get("summary", "No summary available"), "trust_status": resolve_trust_status(update)} for update in updates if update.get("onion_url")], thread_id=str(st.session_state.get("current_thread_id", "shadowpulse")), thread_name=str(st.session_state.get("current_thread_name", "Shadowpulse")), trusted_sources=[{"url": source.get("url"), "title": source.get("title")} for source in trusted_sources]), file_name="shadowpulse_threat_intel_stix21.json", mime="application/json", disabled=not updates)
+        if updates:
+            active_count = sum(1 for u in updates if u.get('last_status_code') == 200)
+            dead_count = len(updates) - active_count
+            stat_col1, stat_col2 = st.columns([1, 2])
+            with stat_col1:
+                st.caption("Link Health Overview")
+                source = pd.DataFrame({"Status": ["Active", "Down"], "Count": [active_count, dead_count], "Color": ["green", "red"]})
+                base = alt.Chart(source).encode(theta=alt.Theta("Count", stack=True))
+                pie = base.mark_arc(outerRadius=80).encode(color=alt.Color("Status", scale=alt.Scale(domain=["Active", "Down"], range=["green", "red"])), tooltip=["Status", "Count"])
+                st.altair_chart(pie, width="stretch")
+            with stat_col2:
+                st.write("")
+                if st.button("🔄 Check Link Status"):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    results_text = st.empty()
+                    def update_progress(completed, total, url, code):
+                        progress_percent = min(completed / total, 1.0)
+                        status_icon = "✅" if code == 200 else "❌"
+                        url_display = url.split('/')[-1][:40] if url and url != "error" else ("error" if url == "error" else "unknown")
+                        status_text.write(f"🔍 Pinging... **{url_display}** {status_icon} ({completed}/{total} checked)")
+                        progress_bar.progress(progress_percent)
+                    results = check_link_status_concurrent(updates, es_client, st.session_state["current_thread_id"], max_workers=10, progress_callback=update_progress)
+                    alive = sum(1 for _, code in results if code == 200)
+                    dead = len(results) - alive
+                    progress_bar.progress(1.0)
+                    status_text.success("✅ Status check complete!")
+                    results_text.info(f"📊 Results: **{alive}** active 🟢 | **{dead}** down 🔴")
+                    clear_dashboard_caches()
+                    st.rerun()
+                if st.button("🗑️ Delete All Dead Links", key="delete_all_dead"):
+                    dead_links = [u for u in updates if u.get('last_status_code') not in [200, 0]]
+                    if dead_links:
+                        for link in dead_links:
+                            try:
+                                database.delete_intel_update(es_client, st.session_state["current_thread_id"], link.get('onion_url'))
+                            except Exception as exc:
+                                print(f"Error deleting {link.get('onion_url')}: {exc}")
+                        st.success(f"✅ Deleted {len(dead_links)} dead links")
+                        clear_dashboard_caches()
+                        st.rerun()
+                    else:
+                        st.info("ℹ️ No dead links to delete. All links are either active or untested.")
+        if updates:
+            page = min(st.session_state["intel_page"], max(0, math.ceil(len(updates) / st.session_state["intel_page_size"]) - 1))
+            visible_updates = updates[page * st.session_state["intel_page_size"]:(page + 1) * st.session_state["intel_page_size"]]
+            nav_col1, nav_col2 = st.columns([1, 1])
+            with nav_col1:
+                if st.button("⬅️ Prev", disabled=page <= 0):
+                    st.session_state["intel_page"] = max(0, page - 1)
+                    st.rerun()
+            with nav_col2:
+                if st.button("Next ➡️", disabled=page >= max(0, math.ceil(len(updates) / st.session_state["intel_page_size"]) - 1)):
+                    st.session_state["intel_page"] = min(max(0, math.ceil(len(updates) / st.session_state["intel_page_size"]) - 1), page + 1)
+                    st.rerun()
+            st.caption(f"Showing page {page + 1} of {max(1, math.ceil(len(updates) / st.session_state['intel_page_size']))}")
+            for update in visible_updates:
+                with st.container():
+                    code = update.get('last_status_code', 0)
+                    status_icon = "✅" if code == 200 else ("⚪" if code == 0 else "❌")
+                    st.markdown(f"**{status_icon} 🔗 {update.get('title', 'Unknown Site')}**")
+                    st.caption(f"Source: `{update.get('onion_url')}` | Tags: {update.get('tags', [])}")
+                    summary = update.get('summary', 'No summary.')
+                    st.info(summary)
+                    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
+                    with c1:
+                        if st.button("🕷 Deep Crawl", key=f"btn_{update.get('onion_url')}"):
+                            from src.core import crawler
+                            with st.spinner("Accessing hidden service..."):
+                                content = crawler.fetch_onion_content(update.get('onion_url'))
+                                if content:
+                                    database.save_intel_update(es_client, st.session_state["current_thread_id"], update.get('onion_url'), update.get('title'), content, tags=update.get('tags', []), last_status_code=200)
+                                    clear_dashboard_caches()
+                                    st.success("Extracted!")
+                                    st.rerun()
+                                else:
+                                    st.error("Site unreachable.")
+                    with c2:
+                        if st.button("⭐ Add to Trust", key=f"add_trust_{update.get('onion_url')}"):
+                            url = update.get('onion_url')
+                            title = update.get('title', 'No title')
+                            if database.add_trusted_source(es_client, st.session_state["current_thread_id"], url, title=title):
+                                clear_dashboard_caches()
+                                st.toast(f"✅ Added '{url}' to the trusted list")
+                                st.rerun()
+                            else:
+                                st.error("❌ Error adding to trust list")
+                    with c3:
+                        if st.button("🚫 Ban Local", key=f"ban_local_{update.get('onion_url')}"):
+                            try:
+                                database.ban_link_locally(es_client, st.session_state["current_thread_id"], update.get('onion_url'))
+                                database.delete_intel_update(es_client, st.session_state["current_thread_id"], update.get('onion_url'))
+                                clear_dashboard_caches()
+                                st.success("✅ Locally banned & removed")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"❌ Error banning link: {exc}")
+                    with c4:
+                        if st.button("🛑 Ban Global", key=f"ban_global_{update.get('onion_url')}"):
+                            try:
+                                database.ban_link_globally(es_client, update.get('onion_url'))
+                                deleted_count = database.delete_link_from_all_threads(es_client, update.get('onion_url'))
+                                clear_dashboard_caches()
+                                st.success(f"✅ Globally banned & removed from {deleted_count} thread(s)")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"❌ Error banning link: {exc}")
+                    with c5:
+                        with st.expander("View Raw Data"):
+                            st.code(update.get('full_content'))
+                    st.markdown("---")
+        else:
+            st.info("No intelligence gathered for this operation yet. Run a scan above.")
 
 # PAGE: BANNED LINKS MANAGEMENT
 elif st.session_state["current_page"] == "banned_links":

@@ -142,7 +142,56 @@ def get_all_threads(client):
     # Extract thread ID and name from each search result hit
     return [{"id": h['_source']['thread_id'], "name": h['_source']['name']} for h in resp['hits']['hits']]
 
-def save_intel_update(client, thread_id, url, title, content, tags=[] ,last_status_code=0):
+def normalize_trust_status(trust_status=None, trusted_urls=None, url=None):
+    """Normalize trust state into the binary Trusted/Untrusted model."""
+    if trust_status in {"Trusted", "Untrusted"}:
+        return trust_status
+
+    normalized_url = str(url or "").strip().lower()
+    trusted_lookup = {
+        str(item).strip().lower()
+        for item in (trusted_urls or [])
+        if str(item).strip()
+    }
+
+    if normalized_url and normalized_url in trusted_lookup:
+        return "Trusted"
+    return "Untrusted"
+
+
+def normalize_scan_result(result, trusted_urls=None):
+    """Normalize a scanned result dict into the dashboard's binary trust schema."""
+    if not isinstance(result, dict):
+        return {}
+
+    normalized = dict(result)
+    onion_url = str(normalized.get("onion_url") or normalized.get("url") or "").strip()
+    title = str(normalized.get("title") or "Untitled").strip() or "Untitled"
+    summary = (
+        str(normalized.get("summary") or normalized.get("description") or "No summary available").strip()
+        or "No summary available"
+    )
+    source = str(normalized.get("source") or "shadowpulse").strip() or "shadowpulse"
+    trust_status = normalize_trust_status(
+        normalized.get("trust_status"),
+        trusted_urls=trusted_urls,
+        url=onion_url,
+    )
+
+    normalized.update(
+        {
+            "onion_url": onion_url,
+            "title": title,
+            "source": source,
+            "summary": summary,
+            "trust_status": trust_status,
+            "is_trusted": trust_status == "Trusted",
+        }
+    )
+    return normalized
+
+
+def save_intel_update(client, thread_id, url, title, content, tags=None, last_status_code=0, trust_status=None):
     """
     Save an intelligence update (discovered link) to Elasticsearch.
     
@@ -174,6 +223,9 @@ def save_intel_update(client, thread_id, url, title, content, tags=[] ,last_stat
         print(f"[Database] Skipped saving {url} - locally banned in thread {thread_id}")
         return False
     
+    tags = tags or []
+    trust_status_value = trust_status or "Untrusted"
+
     # Create the intel update document structure
     doc = {
         "type": "intel_update",                    # Document type identifier
@@ -184,7 +236,9 @@ def save_intel_update(client, thread_id, url, title, content, tags=[] ,last_stat
         "full_content": content,                   # Full page content for deep search
         "scraped_at": datetime.now().isoformat(), # ISO timestamp of when we scraped it
         "tags": tags,                              # User-defined tags for search/filter
-        "last_status_code":last_status_code                       
+        "last_status_code": last_status_code,
+        "trust_status": trust_status_value,
+        "is_trusted": trust_status_value == "Trusted",
     }
     
     # Create a unique ID by combining thread_id and URL.
@@ -686,38 +740,33 @@ def get_thread_keywords(client, thread_id):
 # TRUSTED SOURCES MANAGEMENT
 # ============================================================================
 
-def add_trusted_source(client, thread_id, url, title="No title", trust_score=0.0):
+def add_trusted_source(client, thread_id, url, title="No title"):
     """
     Add a link to the trusted sources list for an operation.
-    
+
     Args:
         client (Elasticsearch): Elasticsearch client
         thread_id (str): Thread ID
         url (str): URL of the trusted source
         title (str): Human-readable title for this source
-        trust_score (float): Trust score between 0.0 and 1.0
-    
+
     Returns:
         bool: True if added successfully, False otherwise
     """
     try:
-        # Clamp trust score between 0 and 1
-        trust_score = max(0.0, min(1.0, float(trust_score)))
-        
         doc = {
             "type": "trusted_source",
             "thread_id": thread_id,
             "url": url,
             "title": title,
-            "trust_score": trust_score,
             "added_at": datetime.now().isoformat()
         }
-        
+
         client.index(
             index=config.INDEX_NAME,
             body=doc
         )
-        print(f"[Trusted] Added trusted source: {url} with score {trust_score}")
+        print(f"[Trusted] Added trusted source: {url}")
         return True
     except Exception as e:
         print(f"[Trusted] Error adding trusted source: {e}")
@@ -726,12 +775,12 @@ def add_trusted_source(client, thread_id, url, title="No title", trust_score=0.0
 
 def get_trusted_sources(client, thread_id):
     """
-    Get all trusted sources for a thread, sorted by trust score (highest first).
-    
+    Get all trusted sources for a thread.
+
     Args:
         client (Elasticsearch): Elasticsearch client
         thread_id (str): Thread ID
-    
+
     Returns:
         list: List of trusted source documents
     """
@@ -748,48 +797,42 @@ def get_trusted_sources(client, thread_id):
             index=config.INDEX_NAME,
             query=query,
             size=500,
-            sort=[{"trust_score": {"order": "desc"}}]
+            sort=[{"added_at": {"order": "desc"}}]
         )
-        
+
         sources = []
         for hit in resp['hits']['hits']:
             source = hit['_source']
             source['_id'] = hit['_id']
             sources.append(source)
-        
+
         return sources
     except Exception as e:
         print(f"[Trusted] Error getting trusted sources: {e}")
         return []
 
 
-def update_trusted_source(client, source_id, title=None, trust_score=None):
+def update_trusted_source(client, source_id, title=None):
     """
-    Update a trusted source's title and/or trust score.
-    
+    Update a trusted source's title.
+
     Args:
         client (Elasticsearch): Elasticsearch client
         source_id (str): Document ID of the trusted source
         title (str): New title (optional)
-        trust_score (float): New trust score 0-1 (optional)
-    
+
     Returns:
         bool: True if updated successfully
     """
     try:
         update_body = {}
-        
+
         if title is not None:
             update_body["title"] = title
-        
-        if trust_score is not None:
-            # Clamp trust score between 0 and 1
-            trust_score = max(0.0, min(1.0, float(trust_score)))
-            update_body["trust_score"] = trust_score
-        
+
         if not update_body:
             return False
-        
+
         client.update(
             index=config.INDEX_NAME,
             id=source_id,
@@ -805,11 +848,11 @@ def update_trusted_source(client, source_id, title=None, trust_score=None):
 def delete_trusted_source(client, source_id):
     """
     Delete a trusted source from the list.
-    
+
     Args:
         client (Elasticsearch): Elasticsearch client
         source_id (str): Document ID of the trusted source
-    
+
     Returns:
         bool: True if deleted successfully
     """
