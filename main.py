@@ -4,6 +4,9 @@ from src.database import database
 from src.core import search_engine
 from src.config import settings as config
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def main():
     print("Shadowpulse : Ready to search")

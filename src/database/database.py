@@ -12,6 +12,9 @@ from datetime import datetime
 import uuid
 import os
 import time
+from dotenv import load_dotenv
+
+load_dotenv()
 def get_es_client(max_retries=5, sleep_seconds=2):
     """
     Connect to the Elasticsearch database with retry logic.
@@ -248,6 +251,62 @@ def save_intel_update(client, thread_id, url, title, content, tags=None, last_st
     client.index(index=config.INDEX_NAME, id=unique_id, document=doc)
     print(f"[Database] Attached intel to Thread {thread_id}")
     return True
+
+
+def save_cti_extraction(
+    client,
+    thread_id,
+    url,
+    title,
+    raw_html,
+    clean_text,
+    extracted_payload,
+    stix_bundle,
+    tags=None,
+    last_status_code=200,
+):
+    """
+    Persist hybrid CTI extraction artifacts under a thread+URL document.
+    """
+    tags = tags or []
+    unique_id = f"{thread_id}_{url}"
+    summary = (
+        extracted_payload.get("llm_intelligence", {}).get("summary")
+        if isinstance(extracted_payload, dict)
+        else None
+    ) or "No summary available"
+    trusted_lookup = {
+        str(item.get("url", "")).strip().lower()
+        for item in get_trusted_sources(client, thread_id)
+        if str(item.get("url", "")).strip()
+    }
+    trust_status = "Trusted" if str(url or "").strip().lower() in trusted_lookup else "Untrusted"
+
+    doc = {
+        "type": "intel_update",
+        "thread_id": thread_id,
+        "onion_url": url,
+        "title": title or url,
+        "summary": summary,
+        "full_content": clean_text,
+        "raw_html": raw_html,
+        "clean_text": clean_text,
+        "cti_payload": extracted_payload,
+        "cti_stix_bundle": stix_bundle,
+        "scraped_at": datetime.now().isoformat(),
+        "tags": tags,
+        "last_status_code": int(last_status_code or 0),
+        "trust_status": trust_status,
+        "is_trusted": trust_status == "Trusted",
+    }
+
+    try:
+        client.update(index=config.INDEX_NAME, id=unique_id, doc=doc, doc_as_upsert=True)
+        print(f"[Database] Saved CTI extraction for {url} in thread {thread_id}")
+        return True
+    except Exception as exc:
+        print(f"[Database] Error saving CTI extraction for {url}: {exc}")
+        return False
 
 def get_thread_data(client, thread_id):
     """

@@ -1,4 +1,7 @@
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Tor Settings
 # In Docker: environment variable points to 'tor' service name

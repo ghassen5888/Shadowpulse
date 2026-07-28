@@ -1,5 +1,7 @@
 # dashboard.py
 import math
+import hashlib
+import json
 import streamlit as st
 import pandas as pd
 import altair as alt  
@@ -15,6 +17,13 @@ import threading
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 from src.core.telemetry import TelemetryBuffer, render_telemetry_panel
 from src.core.stix_exporter import export_stix_bundle_json
+from dotenv import load_dotenv
+
+from ai.extractor import HybridIntelligenceEngine
+from ai.parser import clean_html_to_text
+from ai.stix_exporter import build_stix_bundle_from_payload
+
+load_dotenv()
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -66,6 +75,8 @@ if "scan_query" not in st.session_state:
     st.session_state["scan_query"] = ""
 if "scan_error" not in st.session_state:
     st.session_state["scan_error"] = None
+if "ioc_jobs" not in st.session_state:
+    st.session_state["ioc_jobs"] = {}
 
 # ============================================================================
 # CACHING HELPERS - These reduce database hits and improve performance
@@ -168,6 +179,11 @@ def clear_dashboard_caches():
     get_cached_all_threads.clear()
 
 
+if st.session_state.get("ioc_cache_refresh_required"):
+    clear_dashboard_caches()
+    st.session_state["ioc_cache_refresh_required"] = False
+
+
 def initialize_scan_state():
     """Ensure the scan workflow has thread-safe state buckets for progress and telemetry."""
     st.session_state.setdefault("scan_job_running", False)
@@ -257,6 +273,193 @@ def render_scan_progress_fragment():
 
 
 initialize_scan_state()
+
+
+def _set_ioc_job_status(url, status, **kwargs):
+    jobs = dict(st.session_state.get("ioc_jobs", {}))
+    existing = dict(jobs.get(url, {}))
+    existing.update({"status": status, **kwargs})
+    jobs[url] = existing
+    st.session_state["ioc_jobs"] = jobs
+
+
+def _start_ioc_worker(es_client, thread_id, update):
+    url = str(update.get("onion_url") or "").strip()
+    title = str(update.get("title") or url)
+    tags = list(update.get("tags") or [])
+    if not url:
+        return
+
+    _set_ioc_job_status(url, "running", error="", started_at=datetime.now().isoformat())
+    worker_ctx = get_script_run_ctx()
+
+    def run_worker():
+        if worker_ctx:
+            add_script_run_ctx(threading.current_thread(), worker_ctx)
+        try:
+            response = tor_network.make_request(url, method="GET", timeout=30, engine_name=url)
+            if response is None:
+                _set_ioc_job_status(url, "failed", error="Request failed or timed out")
+                return
+            if response.status_code != 200:
+                _set_ioc_job_status(url, "failed", error=f"HTTP {response.status_code}")
+                return
+
+            raw_html = response.text or ""
+            clean_text = clean_html_to_text(raw_html)
+            extractor = HybridIntelligenceEngine()
+            extracted = extractor.process_raw_html(raw_html, url)
+            cti_payload = extracted.model_dump(mode="json")
+            stix_bundle = build_stix_bundle_from_payload(extracted)
+
+            saved = database.save_cti_extraction(
+                es_client,
+                thread_id,
+                url,
+                title,
+                raw_html,
+                clean_text,
+                cti_payload,
+                stix_bundle,
+                tags=tags,
+                last_status_code=response.status_code,
+            )
+            if not saved:
+                _set_ioc_job_status(url, "failed", error="Failed to persist CTI payload")
+                return
+
+            _set_ioc_job_status(
+                url,
+                "completed",
+                error="",
+                cti_payload=cti_payload,
+                stix_bundle=stix_bundle,
+                completed_at=datetime.now().isoformat(),
+            )
+            st.session_state["ioc_cache_refresh_required"] = True
+        except Exception as exc:
+            _set_ioc_job_status(url, "failed", error=str(exc))
+
+    worker = threading.Thread(target=run_worker, daemon=True)
+    worker.start()
+
+
+def _render_entity_badges(title, entities):
+    st.markdown(f"**{title}:**")
+    if not entities:
+        st.caption("None extracted")
+        return
+    chips = [f"`{item.get('name', 'unknown')} ({float(item.get('confidence', 0.0)):.2f})`" for item in entities]
+    st.markdown(" ".join(chips))
+
+
+def _render_ioc_table(regex_iocs):
+    rows = []
+    for key, label in [
+        ("cves", "CVE"),
+        ("ips", "IPv4"),
+        ("bitcoin_wallets", "Bitcoin Wallet"),
+        ("emails", "Email"),
+        ("sha256", "SHA256"),
+        ("onion_addresses", "Onion"),
+        ("urls", "URL"),
+    ]:
+        for value in regex_iocs.get(key, []):
+            rows.append({"IOC Type": label, "Value": value})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    else:
+        st.caption("No deterministic IOCs found.")
+
+
+def _build_cti_download_json(cti_payload, stix_bundle):
+    return json.dumps(
+        {
+            "extracted_cti_payload": cti_payload,
+            "stix_bundle": stix_bundle,
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _render_cti_intelligence_card(update):
+    cti_payload = update.get("cti_payload")
+    stix_bundle = update.get("cti_stix_bundle")
+    url = str(update.get("onion_url") or "")
+
+    if not isinstance(cti_payload, dict):
+        return
+
+    llm = cti_payload.get("llm_intelligence", {}) or {}
+    regex_iocs = cti_payload.get("regex_iocs", {}) or {}
+    metrics_col1, metrics_col2 = st.columns([2, 1])
+    with metrics_col1:
+        st.info(llm.get("summary") or "LLM processing unavailable")
+        _render_entity_badges("Threat Actors", llm.get("threat_actors") or [])
+        _render_entity_badges("Victims", llm.get("victims") or [])
+        countries = ", ".join(llm.get("target_countries") or []) or "None"
+        industries = ", ".join(llm.get("target_industries") or []) or "None"
+        st.markdown(f"**Target Countries:** {countries}")
+        st.markdown(f"**Target Industries:** {industries}")
+    with metrics_col2:
+        st.metric("Latency (ms)", f"{float(cti_payload.get('execution_latency_ms', 0.0)):.1f}")
+        st.metric("Clean Text Length", int(cti_payload.get("clean_text_length", 0)))
+        st.metric("Text Reduction", f"{float(cti_payload.get('text_reduction_ratio', 0.0)) * 100:.1f}%")
+
+    st.markdown("**Deterministic IOC Table**")
+    _render_ioc_table(regex_iocs)
+
+    if isinstance(stix_bundle, dict):
+        file_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+        st.download_button(
+            label="Download CTI JSON",
+            data=_build_cti_download_json(cti_payload, stix_bundle),
+            file_name=f"CTI_Intel_{file_hash}.json",
+            mime="application/json",
+            key=f"download_cti_{file_hash}",
+        )
+
+
+def _render_ioc_actions(es_client, thread_id, update, button_key_prefix):
+    url = str(update.get("onion_url") or "").strip()
+    if not url:
+        return
+
+    job = (st.session_state.get("ioc_jobs", {}) or {}).get(url, {})
+    status = job.get("status")
+
+    if st.button("🧠 IOC", key=f"{button_key_prefix}_ioc_{url}"):
+        if status == "running":
+            st.warning("IOC extraction already running for this link.")
+        else:
+            _start_ioc_worker(es_client, thread_id, update)
+            st.rerun()
+
+    if status == "running":
+        st.caption("IOC extraction in progress...")
+    elif status == "failed":
+        st.error(f"IOC extraction failed: {job.get('error', 'Unknown error')}")
+
+
+def _has_running_ioc_jobs():
+    jobs = st.session_state.get("ioc_jobs", {}) or {}
+    return any(str(job.get("status")) == "running" for job in jobs.values())
+
+
+def _merge_ioc_job_data(update):
+    url = str(update.get("onion_url") or "").strip()
+    if not url:
+        return update
+    jobs = st.session_state.get("ioc_jobs", {}) or {}
+    job = jobs.get(url, {}) or {}
+    merged = dict(update)
+    if isinstance(job.get("cti_payload"), dict) and not isinstance(merged.get("cti_payload"), dict):
+        merged["cti_payload"] = job.get("cti_payload")
+    if isinstance(job.get("stix_bundle"), dict) and not isinstance(merged.get("cti_stix_bundle"), dict):
+        merged["cti_stix_bundle"] = job.get("stix_bundle")
+    return merged
+
 
 
 # --- Title & Header ---
@@ -782,6 +985,7 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                         st.rerun()
                 st.caption(f"Showing page {page + 1} of {total_pages}")
                 for update in visible_updates:
+                    update = _merge_ioc_job_data(update)
                     with st.container():
                         code = update.get('last_status_code', 0)
                         status_icon = "✅" if code == 200 else ("⚪" if code == 0 else "❌")
@@ -792,25 +996,12 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
 
                         c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
                         with c1:
-                            if st.button("🕷 Deep Crawl", key=f"btn_{update.get('onion_url')}"):
-                                from src.core import crawler
-                                with st.spinner("Accessing hidden service..."):
-                                    content = crawler.fetch_onion_content(update.get('onion_url'))
-                                    if content:
-                                        database.save_intel_update(
-                                            es_client,
-                                            st.session_state["current_thread_id"],
-                                            update.get('onion_url'),
-                                            update.get('title'),
-                                            content,
-                                            tags=update.get('tags', []),
-                                            last_status_code=200
-                                        )
-                                        clear_dashboard_caches()
-                                        st.success("Extracted!")
-                                        st.rerun()
-                                    else:
-                                        st.error("Site unreachable.")
+                            _render_ioc_actions(
+                                es_client,
+                                st.session_state["current_thread_id"],
+                                update,
+                                button_key_prefix="main",
+                            )
 
                         with c2:
                             if st.button("⭐ Add to Trust", key=f"add_trust_{update.get('onion_url')}"):
@@ -849,7 +1040,12 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                             with st.expander("View Raw Data"):
                                 st.code(update.get('full_content'))
 
+                        _render_cti_intelligence_card(update)
+
                         st.markdown("---")
+                if _has_running_ioc_jobs():
+                    time.sleep(0.2)
+                    st.rerun()
             else:
                 st.info("No intelligence gathered for this operation yet. Run a scan above.")
 
@@ -1037,6 +1233,7 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                     st.rerun()
             st.caption(f"Showing page {page + 1} of {max(1, math.ceil(len(updates) / st.session_state['intel_page_size']))}")
             for update in visible_updates:
+                update = _merge_ioc_job_data(update)
                 with st.container():
                     code = update.get('last_status_code', 0)
                     status_icon = "✅" if code == 200 else ("⚪" if code == 0 else "❌")
@@ -1046,17 +1243,12 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                     st.info(summary)
                     c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
                     with c1:
-                        if st.button("🕷 Deep Crawl", key=f"btn_{update.get('onion_url')}"):
-                            from src.core import crawler
-                            with st.spinner("Accessing hidden service..."):
-                                content = crawler.fetch_onion_content(update.get('onion_url'))
-                                if content:
-                                    database.save_intel_update(es_client, st.session_state["current_thread_id"], update.get('onion_url'), update.get('title'), content, tags=update.get('tags', []), last_status_code=200)
-                                    clear_dashboard_caches()
-                                    st.success("Extracted!")
-                                    st.rerun()
-                                else:
-                                    st.error("Site unreachable.")
+                        _render_ioc_actions(
+                            es_client,
+                            st.session_state["current_thread_id"],
+                            update,
+                            button_key_prefix="fallback",
+                        )
                     with c2:
                         if st.button("⭐ Add to Trust", key=f"add_trust_{update.get('onion_url')}"):
                             url = update.get('onion_url')
@@ -1090,7 +1282,11 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                     with c5:
                         with st.expander("View Raw Data"):
                             st.code(update.get('full_content'))
+                    _render_cti_intelligence_card(update)
                     st.markdown("---")
+            if _has_running_ioc_jobs():
+                time.sleep(0.2)
+                st.rerun()
         else:
             st.info("No intelligence gathered for this operation yet. Run a scan above.")
 
@@ -1200,7 +1396,7 @@ else:
     **How to use:**
     1. **Create an Operation** (e.g., "Ransomware Group X")
     2. **Scan for keywords** to populate the thread.
-    3. **Deep Crawl** specific links to extract full text.
+    3. **Run IOC extraction** on specific links to generate hybrid CTI.
     """)
 
 
