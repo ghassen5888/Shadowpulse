@@ -51,6 +51,14 @@ class HybridIntelligenceEngine:
         llm_start = perf_counter()
         try:
             llm_intel = self.llm_client.extract_intelligence(clean_text)
+            if (llm_intel.summary or "").strip() == "LLM processing unavailable":
+                LOGGER.error(
+                    "[SHADOWPULSE DEBUG] [CRITICAL FAILURE] [EXTRACTOR] source=%s llm_returned_generic_fallback",
+                    url,
+                )
+                llm_intel = LLMThreatIntelligence(
+                    summary="LLM extraction failed: Gemini returned generic fallback response"
+                )
         except Exception as exc:
             llm_latency_ms = (perf_counter() - llm_start) * 1000.0
             LOGGER.error(

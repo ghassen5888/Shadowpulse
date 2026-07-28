@@ -51,6 +51,8 @@ class LLMClient:
             self._enabled,
             masked_key,
         )
+        if self.api_key:
+            LOGGER.info("[GEMINI CLIENT] Using API Key starting with: %s...", self.api_key[:5])
 
         if self._enabled:
             try:
@@ -134,8 +136,10 @@ class LLMClient:
             )
 
     def extract_intelligence(self, clean_text: str) -> LLMThreatIntelligence:
-        if not self._enabled or self._genai is None or not clean_text.strip():
-            return self._fallback_response()
+        if not clean_text.strip():
+            return self._fallback_response(summary="LLM extraction skipped: empty text")
+        if not self._enabled or self._genai is None:
+            return self._fallback_response(summary="LLM extraction unavailable: Gemini client not initialized")
         self._log_proxy_env_state()
 
         prompt = (
@@ -144,21 +148,21 @@ class LLMClient:
             f"TEXT:\n{clean_text[:24000]}"
         )
 
-        saw_network_failure = False
+        last_exception: Exception | None = None
         for model_name in self.model_candidates:
             model_start = perf_counter()
             try:
-                model = self._genai.GenerativeModel(
-                    model_name=model_name,
-                    system_instruction=SYSTEM_PROMPT.strip(),
-                )
-                LOGGER.debug(
-                    "[SHADOWPULSE DEBUG] [LLM CLIENT] model=%s generate_content_start timestamp=%s perf_ts=%.6f",
-                    model_name,
-                    datetime.now().isoformat(),
-                    perf_counter(),
-                )
                 with self._without_proxy_env():
+                    model = self._genai.GenerativeModel(
+                        model_name=model_name,
+                        system_instruction=SYSTEM_PROMPT.strip(),
+                    )
+                    LOGGER.debug(
+                        "[SHADOWPULSE DEBUG] [LLM CLIENT] model=%s generate_content_start timestamp=%s perf_ts=%.6f",
+                        model_name,
+                        datetime.now().isoformat(),
+                        perf_counter(),
+                    )
                     response = model.generate_content(
                         prompt,
                         generation_config={
@@ -186,6 +190,8 @@ class LLMClient:
                     exc,
                 )
                 LOGGER.error(traceback.format_exc())
+                LOGGER.error("[GEMINI ERROR] %s", exc, exc_info=True)
+                last_exception = exc
             except Exception as exc:
                 latency_ms = (perf_counter() - model_start) * 1000.0
                 LOGGER.error(
@@ -195,9 +201,9 @@ class LLMClient:
                     exc,
                 )
                 LOGGER.error(traceback.format_exc())
-                if self._is_network_error(exc):
-                    saw_network_failure = True
+                LOGGER.error("[GEMINI ERROR] %s", exc, exc_info=True)
+                last_exception = exc
 
-        if saw_network_failure:
-            return self._fallback_response(summary="")
-        return self._fallback_response()
+        if last_exception is not None:
+            raise RuntimeError("Gemini extraction failed for all configured models") from last_exception
+        return self._fallback_response(summary="LLM extraction unavailable: no model response")
