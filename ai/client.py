@@ -6,7 +6,9 @@ import contextlib
 import json
 import logging
 import os
+from datetime import datetime
 from time import perf_counter
+import traceback
 from typing import Any
 
 from dotenv import load_dotenv
@@ -43,6 +45,12 @@ class LLMClient:
         self.api_key = os.getenv("GEMINI_API_KEY", "").strip()
         self._genai = None
         self._enabled = bool(self.api_key)
+        masked_key = f"{self.api_key[:4]}..." if self.api_key else "MISSING"
+        LOGGER.debug(
+            "[SHADOWPULSE DEBUG] [LLM CLIENT] GEMINI_API_KEY present=%s key_prefix=%s",
+            self._enabled,
+            masked_key,
+        )
 
         if self._enabled:
             try:
@@ -51,13 +59,15 @@ class LLMClient:
                 genai.configure(api_key=self.api_key)
                 self._genai = genai
             except ImportError as exc:
-                LOGGER.error("[LLM CLIENT] Gemini SDK unavailable: %s", exc)
+                LOGGER.error("[SHADOWPULSE DEBUG] [LLM CLIENT] Gemini SDK unavailable: %s", exc)
+                LOGGER.error(traceback.format_exc())
                 self._enabled = False
             except Exception as exc:
-                LOGGER.error("[LLM CLIENT] Gemini initialization error: %s", exc)
+                LOGGER.error("[SHADOWPULSE DEBUG] [LLM CLIENT] Gemini initialization error: %s", exc)
+                LOGGER.error(traceback.format_exc())
                 self._enabled = False
         else:
-            LOGGER.error("[LLM CLIENT] GEMINI_API_KEY is missing or empty.")
+            LOGGER.error("[SHADOWPULSE DEBUG] [LLM CLIENT] GEMINI_API_KEY is missing or empty.")
 
     @staticmethod
     def _fallback_response(summary: str = "LLM processing unavailable") -> LLMThreatIntelligence:
@@ -110,9 +120,23 @@ class LLMClient:
         )
         return any(marker in message for marker in network_markers)
 
+    @staticmethod
+    def _log_proxy_env_state() -> None:
+        proxy_keys = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy")
+        for key in proxy_keys:
+            value = os.environ.get(key)
+            masked_value = value if not value else f"{value[:48]}..."
+            LOGGER.debug(
+                "[SHADOWPULSE DEBUG] [LLM CLIENT] proxy_env %s set=%s value=%s",
+                key,
+                bool(value),
+                masked_value,
+            )
+
     def extract_intelligence(self, clean_text: str) -> LLMThreatIntelligence:
         if not self._enabled or self._genai is None or not clean_text.strip():
             return self._fallback_response()
+        self._log_proxy_env_state()
 
         prompt = (
             "Extract CTI entities from this text.\n"
@@ -128,6 +152,12 @@ class LLMClient:
                     model_name=model_name,
                     system_instruction=SYSTEM_PROMPT.strip(),
                 )
+                LOGGER.debug(
+                    "[SHADOWPULSE DEBUG] [LLM CLIENT] model=%s generate_content_start timestamp=%s perf_ts=%.6f",
+                    model_name,
+                    datetime.now().isoformat(),
+                    perf_counter(),
+                )
                 with self._without_proxy_env():
                     response = model.generate_content(
                         prompt,
@@ -138,25 +168,33 @@ class LLMClient:
                         request_options={"timeout": 30},
                     )
                 latency_ms = (perf_counter() - model_start) * 1000.0
-                LOGGER.error("[LLM CLIENT] model=%s latency_ms=%.1f", model_name, latency_ms)
-                payload = self._to_payload_dict(getattr(response, "text", ""))
+                response_text = getattr(response, "text", "") or ""
+                LOGGER.debug(
+                    "[SHADOWPULSE DEBUG] [LLM CLIENT] model=%s success latency_ms=%.1f response_text_chars=%d",
+                    model_name,
+                    latency_ms,
+                    len(response_text),
+                )
+                payload = self._to_payload_dict(response_text)
                 return LLMThreatIntelligence.model_validate(payload)
             except json.JSONDecodeError as exc:
                 latency_ms = (perf_counter() - model_start) * 1000.0
                 LOGGER.error(
-                    "[LLM CLIENT] model=%s invalid_json latency_ms=%.1f error=%s",
+                    "[SHADOWPULSE DEBUG] [LLM CLIENT] model=%s invalid_json latency_ms=%.1f error=%s",
                     model_name,
                     latency_ms,
                     exc,
                 )
+                LOGGER.error(traceback.format_exc())
             except Exception as exc:
                 latency_ms = (perf_counter() - model_start) * 1000.0
                 LOGGER.error(
-                    "[LLM CLIENT] model=%s failed latency_ms=%.1f error=%s",
+                    "[SHADOWPULSE DEBUG] [LLM CLIENT] model=%s failed latency_ms=%.1f error=%s",
                     model_name,
                     latency_ms,
                     exc,
                 )
+                LOGGER.error(traceback.format_exc())
                 if self._is_network_error(exc):
                     saw_network_failure = True
 

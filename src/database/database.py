@@ -9,12 +9,15 @@ intelligence data. It manages operations, links, and status tracking.
 from elasticsearch import Elasticsearch
 from src.config import settings as config
 from datetime import datetime
+import logging
+import traceback
 import uuid
 import os
 import time
 from dotenv import load_dotenv
 
 load_dotenv()
+LOGGER = logging.getLogger(__name__)
 def get_es_client(max_retries=5, sleep_seconds=2):
     """
     Connect to the Elasticsearch database with retry logic.
@@ -301,10 +304,40 @@ def save_cti_extraction(
     }
 
     try:
-        client.update(index=config.INDEX_NAME, id=unique_id, doc=doc, doc_as_upsert=True)
+        LOGGER.debug(
+            "[SHADOWPULSE DEBUG] [ELASTICSEARCH] write_attempt index=%s doc_id=%s operation_id=%s url=%s",
+            config.INDEX_NAME,
+            unique_id,
+            thread_id,
+            url,
+        )
+        response = client.update(index=config.INDEX_NAME, id=unique_id, doc=doc, doc_as_upsert=True)
+        response_status = getattr(getattr(response, "meta", None), "status", None)
+        response_body = getattr(response, "body", response)
+        response_result = (
+            response_body.get("result")
+            if isinstance(response_body, dict)
+            else "unknown"
+        )
+        LOGGER.debug(
+            "[SHADOWPULSE DEBUG] [ELASTICSEARCH] write_success index=%s doc_id=%s status_code=%s result=%s",
+            config.INDEX_NAME,
+            unique_id,
+            response_status if response_status is not None else "unknown",
+            response_result,
+        )
         print(f"[Database] Saved CTI extraction for {url} in thread {thread_id}")
         return True
     except Exception as exc:
+        LOGGER.error(
+            "[SHADOWPULSE DEBUG] [ELASTICSEARCH] write_failed index=%s doc_id=%s operation_id=%s url=%s error=%s",
+            config.INDEX_NAME,
+            unique_id,
+            thread_id,
+            url,
+            str(exc),
+        )
+        LOGGER.error(traceback.format_exc())
         print(f"[Database] Error saving CTI extraction for {url}: {exc}")
         return False
 

@@ -3,6 +3,7 @@ import math
 import hashlib
 import json
 import logging
+import traceback
 import streamlit as st
 import pandas as pd
 import altair as alt  
@@ -294,6 +295,11 @@ def _start_ioc_worker(es_client, thread_id, update):
     if not url:
         return
 
+    LOGGER.debug(
+        "[SHADOWPULSE DEBUG] [UI] IOC worker starting operation_id=%s target_url=%s",
+        thread_id,
+        url,
+    )
     _set_ioc_job_status(url, "running", error="", started_at=datetime.now().isoformat())
     worker_ctx = get_script_run_ctx()
 
@@ -301,22 +307,28 @@ def _start_ioc_worker(es_client, thread_id, update):
         if worker_ctx:
             add_script_run_ctx(threading.current_thread(), worker_ctx)
         try:
+            LOGGER.debug(
+                "[SHADOWPULSE DEBUG] [TOR FETCH] Dispatching Tor GET operation_id=%s target_url=%s timestamp=%s",
+                thread_id,
+                url,
+                datetime.now().isoformat(),
+            )
             tor_start = perf_counter()
-            response = tor_network.make_request(url, method="GET", timeout=(30, 45), engine_name=url)
+            response = tor_network.make_request(
+                url,
+                method="GET",
+                timeout=(30, 45),
+                engine_name=url,
+                raise_on_error=True,
+            )
             tor_latency_ms = (perf_counter() - tor_start) * 1000.0
-            if response is None:
-                LOGGER.error(
-                    "[TOR SCRAPE] url=%s status=timeout latency_ms=%.1f",
-                    url,
-                    tor_latency_ms,
-                )
-                _set_ioc_job_status(url, "failed", error="Error: Tor target link is offline or unresponsive")
-                return
-            LOGGER.error(
-                "[TOR SCRAPE] url=%s status_code=%s latency_ms=%.1f",
+            LOGGER.debug(
+                "[SHADOWPULSE DEBUG] [TOR FETCH] Success operation_id=%s url=%s status_code=%s duration_s=%.3f raw_html_chars=%d",
+                thread_id,
                 url,
                 response.status_code,
-                tor_latency_ms,
+                tor_latency_ms / 1000.0,
+                len(response.text or ""),
             )
             if response.status_code != 200:
                 _set_ioc_job_status(url, "failed", error=f"HTTP {response.status_code}")
@@ -354,8 +366,41 @@ def _start_ioc_worker(es_client, thread_id, update):
                 completed_at=datetime.now().isoformat(),
             )
             st.session_state["ioc_cache_refresh_required"] = True
+        except requests.exceptions.ProxyError as exc:
+            LOGGER.error(
+                "[SHADOWPULSE DEBUG] [TOR FETCH] ProxyError operation_id=%s url=%s error=%s",
+                thread_id,
+                url,
+                str(exc),
+            )
+            LOGGER.error(traceback.format_exc())
+            _set_ioc_job_status(url, "failed", error=f"ProxyError: {str(exc)}")
+        except requests.exceptions.Timeout as exc:
+            LOGGER.error(
+                "[SHADOWPULSE DEBUG] [TOR FETCH] Timeout operation_id=%s url=%s error=%s",
+                thread_id,
+                url,
+                str(exc),
+            )
+            LOGGER.error(traceback.format_exc())
+            _set_ioc_job_status(url, "failed", error=f"Timeout: {str(exc)}")
+        except requests.exceptions.ConnectionError as exc:
+            LOGGER.error(
+                "[SHADOWPULSE DEBUG] [TOR FETCH] ConnectionError operation_id=%s url=%s error=%s",
+                thread_id,
+                url,
+                str(exc),
+            )
+            LOGGER.error(traceback.format_exc())
+            _set_ioc_job_status(url, "failed", error=f"ConnectionError: {str(exc)}")
         except Exception as exc:
-            LOGGER.error("[IOC WORKER] url=%s failed error=%s", url, exc)
+            LOGGER.error(
+                "[SHADOWPULSE DEBUG] [CRITICAL FAILURE] [IOC WORKER] operation_id=%s url=%s error=%s",
+                thread_id,
+                url,
+                str(exc),
+            )
+            LOGGER.error(traceback.format_exc())
             _set_ioc_job_status(url, "failed", error=str(exc))
 
     worker = threading.Thread(target=run_worker, daemon=True)
@@ -448,6 +493,11 @@ def _render_ioc_actions(es_client, thread_id, update, button_key_prefix):
     status = job.get("status")
 
     if st.button("🧠 IOC", key=f"{button_key_prefix}_ioc_{url}"):
+        LOGGER.debug(
+            "[SHADOWPULSE DEBUG] [UI] IOC button clicked operation_id=%s target_url=%s",
+            thread_id,
+            url,
+        )
         if status == "running":
             st.warning("IOC extraction already running for this link.")
         else:

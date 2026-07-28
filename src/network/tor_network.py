@@ -1,5 +1,8 @@
 import socket
 import threading
+import logging
+import traceback
+from datetime import datetime
 import requests
 from requests.adapters import HTTPAdapter
 from time import perf_counter, sleep
@@ -9,6 +12,7 @@ from src.config import settings as config
 
 _TOR_SESSION_LOCK = threading.Lock()
 _TOR_SESSION = None
+LOGGER = logging.getLogger(__name__)
 
 try:
     import streamlit as st
@@ -47,6 +51,8 @@ def _build_tor_session():
     )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
+    proxy_url = f"socks5h://{config.TOR_PROXY_IP}:{config.TOR_PORT}"
+    LOGGER.debug("[SHADOWPULSE DEBUG] [TOR NETWORK] SOCKS5 proxy configured proxy=%s", proxy_url)
     print("[Tor Network] Cached session created with connection pooling enabled.")
     return session
 
@@ -87,7 +93,7 @@ def setup_tor():
         return False
 
 
-def make_request(url, method="GET", timeout=15, telemetry_callback=None, engine_name=None, **kwargs):
+def make_request(url, method="GET", timeout=15, telemetry_callback=None, engine_name=None, raise_on_error=False, **kwargs):
     """Make an HTTP request through Tor while emitting explicit telemetry for failures."""
     session = get_tor_session()
     request_name = engine_name or url
@@ -110,9 +116,26 @@ def make_request(url, method="GET", timeout=15, telemetry_callback=None, engine_
     def _do_request(attempts_remaining=2):
         nonlocal start_time
         try:
+            request_ts = perf_counter()
+            LOGGER.debug(
+                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_start method=%s url=%s timestamp=%s perf_ts=%.6f timeout=%s",
+                method.upper(),
+                url,
+                datetime.now().isoformat(),
+                request_ts,
+                timeout_label,
+            )
             response = session.request(method.upper(), url, timeout=request_timeout, **kwargs)
             elapsed_ms = (perf_counter() - start_time) * 1000.0
             payload_bytes = len(getattr(response, "content", b"") or b"")
+            LOGGER.debug(
+                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_success method=%s url=%s status_code=%s duration_s=%.3f response_chars=%d",
+                method.upper(),
+                url,
+                response.status_code,
+                elapsed_ms / 1000.0,
+                len(response.text or ""),
+            )
 
             if response.status_code >= 400:
                 error_phrase = (response.text or "").lower()
@@ -135,7 +158,31 @@ def make_request(url, method="GET", timeout=15, telemetry_callback=None, engine_
         except requests.exceptions.Timeout as exc:
             elapsed_ms = (perf_counter() - start_time) * 1000.0
             emit("Socket Timeout", elapsed_ms, 0, "❌", f"Timed out after {timeout_label}")
+            LOGGER.error(
+                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=Timeout method=%s url=%s duration_s=%.3f error=%s",
+                method.upper(),
+                url,
+                elapsed_ms / 1000.0,
+                exc,
+            )
+            LOGGER.error(traceback.format_exc())
             print(f"[Tor Network] ⏱️ Timeout ({timeout_label}) on {url}: {exc}")
+            if raise_on_error:
+                raise
+            return None
+        except requests.exceptions.ProxyError as exc:
+            elapsed_ms = (perf_counter() - start_time) * 1000.0
+            emit("Socket Timeout", elapsed_ms, 0, "❌", str(exc))
+            LOGGER.error(
+                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=ProxyError method=%s url=%s duration_s=%.3f error=%s",
+                method.upper(),
+                url,
+                elapsed_ms / 1000.0,
+                exc,
+            )
+            LOGGER.error(traceback.format_exc())
+            if raise_on_error:
+                raise
             return None
         except requests.exceptions.ConnectionError as exc:
             elapsed_ms = (perf_counter() - start_time) * 1000.0
@@ -147,7 +194,17 @@ def make_request(url, method="GET", timeout=15, telemetry_callback=None, engine_
                     sleep(1)
                     return _do_request(attempts_remaining - 1)
             emit("Socket Timeout", elapsed_ms, 0, "❌", str(exc))
+            LOGGER.error(
+                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=ConnectionError method=%s url=%s duration_s=%.3f error=%s",
+                method.upper(),
+                url,
+                elapsed_ms / 1000.0,
+                exc,
+            )
+            LOGGER.error(traceback.format_exc())
             print(f"[Tor Network] Connection error on {url}: {exc}")
+            if raise_on_error:
+                raise
             return None
         except Exception as exc:
             elapsed_ms = (perf_counter() - start_time) * 1000.0
@@ -159,7 +216,17 @@ def make_request(url, method="GET", timeout=15, telemetry_callback=None, engine_
                     sleep(1)
                     return _do_request(attempts_remaining - 1)
             emit("Socket Timeout", elapsed_ms, 0, "❌", str(exc))
+            LOGGER.error(
+                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=Unhandled method=%s url=%s duration_s=%.3f error=%s",
+                method.upper(),
+                url,
+                elapsed_ms / 1000.0,
+                exc,
+            )
+            LOGGER.error(traceback.format_exc())
             print(f"[Tor Network] Error on {url}: {exc}")
+            if raise_on_error:
+                raise
             return None
 
     return _do_request()

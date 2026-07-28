@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
+from time import perf_counter
 
 from ai.schemas import RegexIOCs
+
+LOGGER = logging.getLogger(__name__)
 
 
 class RegexEngine:
@@ -22,6 +26,7 @@ class RegexEngine:
 
     @classmethod
     def extract_all(cls, text: str) -> RegexIOCs:
+        regex_start = perf_counter()
         data = text or ""
         cves = sorted({match.upper() for match in cls.CVE_PATTERN.findall(data)})
         ips = sorted(set(cls.IPV4_PATTERN.findall(data)))
@@ -37,7 +42,7 @@ class RegexEngine:
         onion_addresses = sorted({match.lower() for match in cls.ONION_PATTERN.findall(data)})
         urls = sorted({match.rstrip(".,;:)") for match in cls.URL_PATTERN.findall(data)})
 
-        return RegexIOCs(
+        result = RegexIOCs(
             cves=cves,
             ips=ips,
             emails=emails,
@@ -46,3 +51,11 @@ class RegexEngine:
             onion_addresses=onion_addresses,
             urls=urls,
         )
+        total_iocs = sum(len(values) for values in result.model_dump(mode="json").values())
+        regex_duration_ms = (perf_counter() - regex_start) * 1000.0
+        LOGGER.debug(
+            "[SHADOWPULSE DEBUG] [REGEX ENGINE] Regex extraction complete duration_ms=%.1f total_iocs=%d",
+            regex_duration_ms,
+            total_iocs,
+        )
+        return result
