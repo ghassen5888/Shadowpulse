@@ -2,11 +2,13 @@
 import math
 import hashlib
 import json
+import logging
 import streamlit as st
 import pandas as pd
 import altair as alt  
 from datetime import datetime
 import time  
+from time import perf_counter
 from src.config import settings as config
 from src.database import database
 from src.core import search_engine
@@ -24,6 +26,8 @@ from ai.parser import clean_html_to_text
 from ai.stix_exporter import build_stix_bundle_from_payload
 
 load_dotenv()
+
+LOGGER = logging.getLogger(__name__)
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -297,10 +301,23 @@ def _start_ioc_worker(es_client, thread_id, update):
         if worker_ctx:
             add_script_run_ctx(threading.current_thread(), worker_ctx)
         try:
-            response = tor_network.make_request(url, method="GET", timeout=30, engine_name=url)
+            tor_start = perf_counter()
+            response = tor_network.make_request(url, method="GET", timeout=(30, 45), engine_name=url)
+            tor_latency_ms = (perf_counter() - tor_start) * 1000.0
             if response is None:
-                _set_ioc_job_status(url, "failed", error="Request failed or timed out")
+                LOGGER.error(
+                    "[TOR SCRAPE] url=%s status=timeout latency_ms=%.1f",
+                    url,
+                    tor_latency_ms,
+                )
+                _set_ioc_job_status(url, "failed", error="Error: Tor target link is offline or unresponsive")
                 return
+            LOGGER.error(
+                "[TOR SCRAPE] url=%s status_code=%s latency_ms=%.1f",
+                url,
+                response.status_code,
+                tor_latency_ms,
+            )
             if response.status_code != 200:
                 _set_ioc_job_status(url, "failed", error=f"HTTP {response.status_code}")
                 return
@@ -338,6 +355,7 @@ def _start_ioc_worker(es_client, thread_id, update):
             )
             st.session_state["ioc_cache_refresh_required"] = True
         except Exception as exc:
+            LOGGER.error("[IOC WORKER] url=%s failed error=%s", url, exc)
             _set_ioc_job_status(url, "failed", error=str(exc))
 
     worker = threading.Thread(target=run_worker, daemon=True)

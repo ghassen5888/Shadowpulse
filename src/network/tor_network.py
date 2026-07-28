@@ -91,6 +91,14 @@ def make_request(url, method="GET", timeout=15, telemetry_callback=None, engine_
     """Make an HTTP request through Tor while emitting explicit telemetry for failures."""
     session = get_tor_session()
     request_name = engine_name or url
+    if isinstance(timeout, tuple):
+        connect_timeout, read_timeout = timeout
+        timeout_label = f"{connect_timeout}/{read_timeout}s"
+        request_timeout = (connect_timeout, read_timeout)
+    else:
+        connect_timeout, read_timeout = 5, timeout
+        timeout_label = f"{timeout}s"
+        request_timeout = (connect_timeout, read_timeout)
 
     def emit(phase, latency_ms, payload_bytes, status_icon, detail=""):
         if telemetry_callback is not None:
@@ -102,7 +110,7 @@ def make_request(url, method="GET", timeout=15, telemetry_callback=None, engine_
     def _do_request(attempts_remaining=2):
         nonlocal start_time
         try:
-            response = session.request(method.upper(), url, timeout=(5, timeout), **kwargs)
+            response = session.request(method.upper(), url, timeout=request_timeout, **kwargs)
             elapsed_ms = (perf_counter() - start_time) * 1000.0
             payload_bytes = len(getattr(response, "content", b"") or b"")
 
@@ -126,8 +134,8 @@ def make_request(url, method="GET", timeout=15, telemetry_callback=None, engine_
             return response
         except requests.exceptions.Timeout as exc:
             elapsed_ms = (perf_counter() - start_time) * 1000.0
-            emit("Socket Timeout", elapsed_ms, 0, "❌", f"Timed out after {timeout}s")
-            print(f"[Tor Network] ⏱️ Timeout ({timeout}s) on {url}: {exc}")
+            emit("Socket Timeout", elapsed_ms, 0, "❌", f"Timed out after {timeout_label}")
+            print(f"[Tor Network] ⏱️ Timeout ({timeout_label}) on {url}: {exc}")
             return None
         except requests.exceptions.ConnectionError as exc:
             elapsed_ms = (perf_counter() - start_time) * 1000.0

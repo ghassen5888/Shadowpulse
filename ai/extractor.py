@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from time import perf_counter
 
 from ai.client import LLMClient
 from ai.parser import clean_html_to_text
 from ai.regex_engine import RegexEngine
-from ai.schemas import ExtractedCTIPayload
+from ai.schemas import ExtractedCTIPayload, LLMThreatIntelligence
+
+LOGGER = logging.getLogger(__name__)
 
 
 class HybridIntelligenceEngine:
@@ -20,7 +23,21 @@ class HybridIntelligenceEngine:
 
         clean_text = clean_html_to_text(raw_html)
         regex_iocs = self.regex_engine.extract_all(clean_text)
-        llm_intel = self.llm_client.extract_intelligence(clean_text)
+        regex_ioc_count = sum(len(values) for values in regex_iocs.model_dump(mode="json").values())
+        LOGGER.error("[REGEX ENGINE] source=%s extracted_iocs=%d", url, regex_ioc_count)
+
+        llm_start = perf_counter()
+        try:
+            llm_intel = self.llm_client.extract_intelligence(clean_text)
+        except Exception as exc:
+            llm_latency_ms = (perf_counter() - llm_start) * 1000.0
+            LOGGER.error(
+                "[LLM CLIENT] source=%s failed latency_ms=%.1f error=%s",
+                url,
+                llm_latency_ms,
+                exc,
+            )
+            llm_intel = LLMThreatIntelligence(summary="")
 
         elapsed_ms = (perf_counter() - start) * 1000.0
         raw_len = len(raw_html or "")

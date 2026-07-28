@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
+from time import perf_counter
 from typing import Any
 
 from dotenv import load_dotenv
@@ -11,6 +14,8 @@ from dotenv import load_dotenv
 from ai.schemas import LLMThreatIntelligence
 
 load_dotenv()
+
+LOGGER = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """
 You are a cyber threat intelligence extraction engine.
@@ -46,15 +51,17 @@ class LLMClient:
                 genai.configure(api_key=self.api_key)
                 self._genai = genai
             except ImportError as exc:
-                print(f"[LLMClient] Gemini SDK unavailable: {exc}")
+                LOGGER.error("[LLM CLIENT] Gemini SDK unavailable: %s", exc)
                 self._enabled = False
             except Exception as exc:
-                print(f"[LLMClient] Gemini initialization error: {exc}")
+                LOGGER.error("[LLM CLIENT] Gemini initialization error: %s", exc)
                 self._enabled = False
+        else:
+            LOGGER.error("[LLM CLIENT] GEMINI_API_KEY is missing or empty.")
 
     @staticmethod
-    def _fallback_response() -> LLMThreatIntelligence:
-        return LLMThreatIntelligence(summary="LLM processing unavailable")
+    def _fallback_response(summary: str = "LLM processing unavailable") -> LLMThreatIntelligence:
+        return LLMThreatIntelligence(summary=summary)
 
     @staticmethod
     def _to_payload_dict(raw_text: str) -> dict[str, Any]:
@@ -62,6 +69,46 @@ class LLMClient:
         if not text:
             return {}
         return json.loads(text)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _without_proxy_env():
+        proxy_keys = (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        )
+        previous = {key: os.environ.get(key) for key in proxy_keys}
+        try:
+            for key in proxy_keys:
+                if key in os.environ:
+                    del os.environ[key]
+            yield
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    @staticmethod
+    def _is_network_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        network_markers = (
+            "timeout",
+            "timed out",
+            "connection",
+            "network",
+            "ssl",
+            "tls",
+            "socket",
+            "proxy",
+            "unreachable",
+        )
+        return any(marker in message for marker in network_markers)
 
     def extract_intelligence(self, clean_text: str) -> LLMThreatIntelligence:
         if not self._enabled or self._genai is None or not clean_text.strip():
@@ -73,25 +120,46 @@ class LLMClient:
             f"TEXT:\n{clean_text[:24000]}"
         )
 
+        saw_network_failure = False
         for model_name in self.model_candidates:
+            model_start = perf_counter()
             try:
                 model = self._genai.GenerativeModel(
                     model_name=model_name,
                     system_instruction=SYSTEM_PROMPT.strip(),
                 )
-                response = model.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.1,
-                        "response_mime_type": "application/json",
-                    },
-                    request_options={"timeout": 30},
-                )
+                with self._without_proxy_env():
+                    response = model.generate_content(
+                        prompt,
+                        generation_config={
+                            "temperature": 0.1,
+                            "response_mime_type": "application/json",
+                        },
+                        request_options={"timeout": 30},
+                    )
+                latency_ms = (perf_counter() - model_start) * 1000.0
+                LOGGER.error("[LLM CLIENT] model=%s latency_ms=%.1f", model_name, latency_ms)
                 payload = self._to_payload_dict(getattr(response, "text", ""))
                 return LLMThreatIntelligence.model_validate(payload)
             except json.JSONDecodeError as exc:
-                print(f"[LLMClient] Invalid JSON from {model_name}: {exc}")
+                latency_ms = (perf_counter() - model_start) * 1000.0
+                LOGGER.error(
+                    "[LLM CLIENT] model=%s invalid_json latency_ms=%.1f error=%s",
+                    model_name,
+                    latency_ms,
+                    exc,
+                )
             except Exception as exc:
-                print(f"[LLMClient] Model {model_name} failed: {exc}")
+                latency_ms = (perf_counter() - model_start) * 1000.0
+                LOGGER.error(
+                    "[LLM CLIENT] model=%s failed latency_ms=%.1f error=%s",
+                    model_name,
+                    latency_ms,
+                    exc,
+                )
+                if self._is_network_error(exc):
+                    saw_network_failure = True
 
+        if saw_network_failure:
+            return self._fallback_response(summary="")
         return self._fallback_response()
