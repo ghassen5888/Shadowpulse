@@ -21,19 +21,21 @@ services:
       start_period: 30s
 
   # Tor SOCKS proxy
-  tor:
+  shadowpulse-tor:
     image: peterdavehello/tor-socks-proxy:latest
     container_name: shadowpulse-tor
     ports:
-      - "9050:9150"
+      - "9050:9050"
+    volumes:
+      - ./docker/torrc:/etc/tor/torrc:ro
     networks:
       - shadowpulse-network
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "9150"]
+      test: ["CMD-SHELL", "grep -q ':235A ' /proc/net/tcp || grep -q ':235A ' /proc/net/tcp6"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 20s
 
   # Shadowpulse Python application
   app:
@@ -41,12 +43,16 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: shadowpulse-app
+    env_file:
+      - .env
     environment:
       # Point to Elasticsearch service instead of localhost
       - ES_HOST=http://elasticsearch:9200
       # Point to Tor service instead of localhost
-      - TOR_PROXY_IP=tor
-      - TOR_PORT=9150
+      - TOR_PROXY_IP=shadowpulse-tor
+      - TOR_PORT=9050
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-flash-latest}
       # Ensure PYTHONPATH is set in the container
       - PYTHONPATH=/app:$PYTHONPATH
     ports:
@@ -54,7 +60,7 @@ services:
     depends_on:
       elasticsearch:
         condition: service_healthy
-      tor:
+      shadowpulse-tor:
         condition: service_healthy
     networks:
       - shadowpulse-network

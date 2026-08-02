@@ -5,7 +5,7 @@ import traceback
 from datetime import datetime
 import requests
 from requests.adapters import HTTPAdapter
-from time import perf_counter, sleep
+from time import perf_counter
 from urllib3.util.retry import Retry
 
 from src.config import settings as config
@@ -23,6 +23,26 @@ except ModuleNotFoundError:  # pragma: no cover - test environments may not inst
             return func
 
     st = _StreamlitFallback()
+
+
+class TorResolutionError(requests.exceptions.ConnectionError):
+    """Raised when Tor reports hidden-service resolution/connectivity failure."""
+
+
+_TOR_RESOLUTION_ERROR_MARKERS = (
+    "no more hsdir available to query",
+    "hsdir",
+    "host unreachable",
+    "socks",
+    "failed to establish a new connection",
+    "name or service not known",
+    "temporary failure in name resolution",
+)
+
+
+def is_tor_resolution_error(error):
+    message = str(error or "").lower()
+    return any(marker in message for marker in _TOR_RESOLUTION_ERROR_MARKERS)
 
 
 def _build_tor_session():
@@ -43,10 +63,14 @@ def _build_tor_session():
         pool_maxsize=100,
         pool_block=False,
         max_retries=Retry(
-            total=2,
-            backoff_factor=0.4,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "HEAD", "POST", "PUT", "DELETE"],
+            total=0,
+            connect=0,
+            read=0,
+            redirect=0,
+            status=0,
+            other=0,
+            backoff_factor=0.0,
+            allowed_methods=False,
         ),
     )
     session.mount("http://", adapter)
@@ -113,120 +137,109 @@ def make_request(url, method="GET", timeout=15, telemetry_callback=None, engine_
     emit("DNS Resolution", 0.0, 0, "🔄", "Initiating request")
     start_time = perf_counter()
 
-    def _do_request(attempts_remaining=2):
-        nonlocal start_time
-        try:
-            request_ts = perf_counter()
-            LOGGER.debug(
-                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_start method=%s url=%s timestamp=%s perf_ts=%.6f timeout=%s",
-                method.upper(),
-                url,
-                datetime.now().isoformat(),
-                request_ts,
-                timeout_label,
-            )
-            response = session.request(method.upper(), url, timeout=request_timeout, **kwargs)
-            elapsed_ms = (perf_counter() - start_time) * 1000.0
-            payload_bytes = len(getattr(response, "content", b"") or b"")
-            LOGGER.debug(
-                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_success method=%s url=%s status_code=%s duration_s=%.3f response_chars=%d",
-                method.upper(),
-                url,
-                response.status_code,
-                elapsed_ms / 1000.0,
-                len(response.text or ""),
-            )
+    try:
+        request_ts = perf_counter()
+        LOGGER.debug(
+            "[SHADOWPULSE DEBUG] [TOR NETWORK] request_start method=%s url=%s timestamp=%s perf_ts=%.6f timeout=%s",
+            method.upper(),
+            url,
+            datetime.now().isoformat(),
+            request_ts,
+            timeout_label,
+        )
+        response = session.request(method.upper(), url, timeout=request_timeout, **kwargs)
+        elapsed_ms = (perf_counter() - start_time) * 1000.0
+        payload_bytes = len(getattr(response, "content", b"") or b"")
+        LOGGER.debug(
+            "[SHADOWPULSE DEBUG] [TOR NETWORK] request_success method=%s url=%s status_code=%s duration_s=%.3f response_chars=%d",
+            method.upper(),
+            url,
+            response.status_code,
+            elapsed_ms / 1000.0,
+            len(response.text or ""),
+        )
 
-            if response.status_code >= 400:
-                error_phrase = (response.text or "").lower()
-                if "no more hsdir available to query" in error_phrase or "hsdir" in error_phrase:
-                    print(f"[Tor Network] HSDir failure detected for {url}, resetting session and retrying...")
-                    reset_tor_session()
-                    if attempts_remaining > 1:
-                        sleep(1)
-                        return _do_request(attempts_remaining - 1)
+        if response.status_code >= 400:
+            error_phrase = (response.text or "").lower()
+            if is_tor_resolution_error(error_phrase):
+                resolution_error = TorResolutionError(f"Tor resolution failed for {url}: HTTP {response.status_code}")
+                emit("Tor Resolution Failed", elapsed_ms, 0, "❌", str(resolution_error))
+                if raise_on_error:
+                    raise resolution_error
+                return None
 
-                emit("Completed", elapsed_ms, payload_bytes, "❌", f"HTTP {response.status_code}")
-                print(f"[Tor Network] HTTP {response.status_code} for {url}")
-                return response
-
-            emit("Handshake", elapsed_ms * 0.35, 0, "🔄", "Proxy negotiation")
-            emit("Connected", elapsed_ms * 0.6, 0, "🔄", f"HTTP {response.status_code}")
-            emit("Streaming Payload", elapsed_ms * 0.9, payload_bytes, "✅", f"Received {payload_bytes} bytes")
-            emit("Completed", elapsed_ms, payload_bytes, "✅", f"HTTP {response.status_code}")
+            emit("Completed", elapsed_ms, payload_bytes, "❌", f"HTTP {response.status_code}")
+            print(f"[Tor Network] HTTP {response.status_code} for {url}")
             return response
-        except requests.exceptions.Timeout as exc:
-            elapsed_ms = (perf_counter() - start_time) * 1000.0
-            emit("Socket Timeout", elapsed_ms, 0, "❌", f"Timed out after {timeout_label}")
-            LOGGER.error(
-                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=Timeout method=%s url=%s duration_s=%.3f error=%s",
-                method.upper(),
-                url,
-                elapsed_ms / 1000.0,
-                exc,
-            )
-            LOGGER.error(traceback.format_exc())
-            print(f"[Tor Network] ⏱️ Timeout ({timeout_label}) on {url}: {exc}")
-            if raise_on_error:
-                raise
-            return None
-        except requests.exceptions.ProxyError as exc:
-            elapsed_ms = (perf_counter() - start_time) * 1000.0
-            emit("Socket Timeout", elapsed_ms, 0, "❌", str(exc))
-            LOGGER.error(
-                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=ProxyError method=%s url=%s duration_s=%.3f error=%s",
-                method.upper(),
-                url,
-                elapsed_ms / 1000.0,
-                exc,
-            )
-            LOGGER.error(traceback.format_exc())
-            if raise_on_error:
-                raise
-            return None
-        except requests.exceptions.ConnectionError as exc:
-            elapsed_ms = (perf_counter() - start_time) * 1000.0
-            message = str(exc).lower()
-            if "hsdir" in message or "no more hsdir available to query" in message:
-                print(f"[Tor Network] HSDir connection error detected for {url}, resetting session and retrying...")
-                reset_tor_session()
-                if attempts_remaining > 1:
-                    sleep(1)
-                    return _do_request(attempts_remaining - 1)
-            emit("Socket Timeout", elapsed_ms, 0, "❌", str(exc))
-            LOGGER.error(
-                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=ConnectionError method=%s url=%s duration_s=%.3f error=%s",
-                method.upper(),
-                url,
-                elapsed_ms / 1000.0,
-                exc,
-            )
-            LOGGER.error(traceback.format_exc())
-            print(f"[Tor Network] Connection error on {url}: {exc}")
-            if raise_on_error:
-                raise
-            return None
-        except Exception as exc:
-            elapsed_ms = (perf_counter() - start_time) * 1000.0
-            message = str(exc).lower()
-            if "hsdir" in message or "no more hsdir available to query" in message:
-                print(f"[Tor Network] HSDir internal error detected for {url}, resetting session and retrying...")
-                reset_tor_session()
-                if attempts_remaining > 1:
-                    sleep(1)
-                    return _do_request(attempts_remaining - 1)
-            emit("Socket Timeout", elapsed_ms, 0, "❌", str(exc))
-            LOGGER.error(
-                "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=Unhandled method=%s url=%s duration_s=%.3f error=%s",
-                method.upper(),
-                url,
-                elapsed_ms / 1000.0,
-                exc,
-            )
-            LOGGER.error(traceback.format_exc())
-            print(f"[Tor Network] Error on {url}: {exc}")
-            if raise_on_error:
-                raise
-            return None
 
-    return _do_request()
+        emit("Handshake", elapsed_ms * 0.35, 0, "🔄", "Proxy negotiation")
+        emit("Connected", elapsed_ms * 0.6, 0, "🔄", f"HTTP {response.status_code}")
+        emit("Streaming Payload", elapsed_ms * 0.9, payload_bytes, "✅", f"Received {payload_bytes} bytes")
+        emit("Completed", elapsed_ms, payload_bytes, "✅", f"HTTP {response.status_code}")
+        return response
+    except requests.exceptions.Timeout as exc:
+        elapsed_ms = (perf_counter() - start_time) * 1000.0
+        emit("Socket Timeout", elapsed_ms, 0, "❌", f"Timed out after {timeout_label}")
+        LOGGER.error(
+            "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=Timeout method=%s url=%s duration_s=%.3f error=%s",
+            method.upper(),
+            url,
+            elapsed_ms / 1000.0,
+            exc,
+        )
+        LOGGER.error(traceback.format_exc())
+        print(f"[Tor Network] ⏱️ Timeout ({timeout_label}) on {url}: {exc}")
+        if raise_on_error:
+            raise
+        return None
+    except requests.exceptions.ProxyError as exc:
+        elapsed_ms = (perf_counter() - start_time) * 1000.0
+        emit("Tor Resolution Failed", elapsed_ms, 0, "❌", str(exc))
+        LOGGER.error(
+            "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=ProxyError method=%s url=%s duration_s=%.3f error=%s",
+            method.upper(),
+            url,
+            elapsed_ms / 1000.0,
+            exc,
+        )
+        LOGGER.error(traceback.format_exc())
+        resolution_error = TorResolutionError(str(exc))
+        if raise_on_error:
+            raise resolution_error from exc
+        return None
+    except requests.exceptions.ConnectionError as exc:
+        elapsed_ms = (perf_counter() - start_time) * 1000.0
+        emit("Tor Resolution Failed", elapsed_ms, 0, "❌", str(exc))
+        LOGGER.error(
+            "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=ConnectionError method=%s url=%s duration_s=%.3f error=%s",
+            method.upper(),
+            url,
+            elapsed_ms / 1000.0,
+            exc,
+        )
+        LOGGER.error(traceback.format_exc())
+        print(f"[Tor Network] Connection error on {url}: {exc}")
+        resolution_error = TorResolutionError(str(exc))
+        if raise_on_error:
+            raise resolution_error from exc
+        return None
+    except Exception as exc:
+        elapsed_ms = (perf_counter() - start_time) * 1000.0
+        emit("Socket Timeout", elapsed_ms, 0, "❌", str(exc))
+        LOGGER.error(
+            "[SHADOWPULSE DEBUG] [TOR NETWORK] request_error category=Unhandled method=%s url=%s duration_s=%.3f error=%s",
+            method.upper(),
+            url,
+            elapsed_ms / 1000.0,
+            exc,
+        )
+        LOGGER.error(traceback.format_exc())
+        print(f"[Tor Network] Error on {url}: {exc}")
+        if is_tor_resolution_error(exc):
+            resolution_error = TorResolutionError(str(exc))
+            if raise_on_error:
+                raise resolution_error from exc
+            return None
+        if raise_on_error:
+            raise
+        return None

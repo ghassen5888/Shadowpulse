@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 
 from src.network import tor_network
+from src.database import database
 
 
 def _extract_onion_urls(value):
@@ -44,9 +45,14 @@ def parse_onion_html(html_content, source_url=None):
     return links
 
 
-def fetch_onion_content(url, timeout=15, telemetry_callback=None):
+def fetch_onion_content(url, timeout=15, telemetry_callback=None, es_client=None, thread_id=None):
     """Fetch and parse content from an onion site while handling timeouts and malformed HTML."""
     print(f"[Crawler] Visiting: {url}")
+    if es_client and thread_id:
+        should_skip, reason = database.is_url_in_offline_cooldown(es_client, thread_id, url)
+        if should_skip:
+            print(f"[Crawler] Skipping {url}: {reason}")
+            return None
     try:
         response = tor_network.make_request(
             url,
@@ -54,6 +60,7 @@ def fetch_onion_content(url, timeout=15, telemetry_callback=None):
             timeout=timeout,
             telemetry_callback=telemetry_callback,
             engine_name=url,
+            raise_on_error=True,
         )
         if response is None:
             print("[Crawler] Request failed or timed out")
@@ -75,18 +82,26 @@ def fetch_onion_content(url, timeout=15, telemetry_callback=None):
 
         print(f"[Crawler] ✅ Successfully extracted {len(clean_text)} characters")
         return clean_text
+    except tor_network.TorResolutionError as exc:
+        print(f"[Crawler] ❌ Tor resolution failed for {url}: {exc}")
+        if es_client and thread_id:
+            database.mark_url_offline(es_client, thread_id, url, str(exc), status=database.URL_STATUS_DEAD)
+        return None
     except Exception as exc:
         print(f"[Crawler] ❌ Error: {exc}")
         return None
 
 
-def fetch_onion_content_batch(urls, max_workers=5, timeout=15):
+def fetch_onion_content_batch(urls, max_workers=5, timeout=15, es_client=None, thread_id=None):
     """Fetch multiple onion pages concurrently and aggregate the results."""
     print(f"[Crawler] Batch fetching {len(urls)} URLs (max_workers={max_workers})")
     results = {}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_onion_content, url, timeout): url for url in urls}
+        futures = {
+            executor.submit(fetch_onion_content, url, timeout, None, es_client, thread_id): url
+            for url in urls
+        }
         completed = 0
         for future in as_completed(futures):
             completed += 1

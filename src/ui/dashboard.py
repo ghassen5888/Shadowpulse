@@ -184,6 +184,15 @@ def clear_dashboard_caches():
     get_cached_all_threads.clear()
 
 
+def _should_skip_target_url(es_client, thread_id, url):
+    normalized_url = str(url or "").strip()
+    if not normalized_url:
+        return True, "Missing URL"
+    if not es_client or not thread_id:
+        return False, ""
+    return database.is_url_in_offline_cooldown(es_client, thread_id, normalized_url)
+
+
 if st.session_state.get("ioc_cache_refresh_required"):
     clear_dashboard_caches()
     st.session_state["ioc_cache_refresh_required"] = False
@@ -300,6 +309,10 @@ def _start_ioc_worker(es_client, thread_id, update):
         thread_id,
         url,
     )
+    should_skip, skip_reason = _should_skip_target_url(es_client, thread_id, url)
+    if should_skip:
+        _set_ioc_job_status(url, "failed", error=f"Skipped due to offline cooldown: {skip_reason}")
+        return
     _set_ioc_job_status(url, "running", error="", started_at=datetime.now().isoformat())
     worker_ctx = get_script_run_ctx()
 
@@ -357,6 +370,8 @@ def _start_ioc_worker(es_client, thread_id, update):
                 _set_ioc_job_status(url, "failed", error="Failed to persist CTI payload")
                 return
 
+            database.mark_url_active(es_client, thread_id, url, status_code=response.status_code)
+
             _set_ioc_job_status(
                 url,
                 "completed",
@@ -375,6 +390,17 @@ def _start_ioc_worker(es_client, thread_id, update):
             )
             LOGGER.error(traceback.format_exc())
             _set_ioc_job_status(url, "failed", error=f"ProxyError: {str(exc)}")
+        except tor_network.TorResolutionError as exc:
+            LOGGER.error(
+                "[SHADOWPULSE DEBUG] [TOR FETCH] TorResolutionError operation_id=%s url=%s error=%s",
+                thread_id,
+                url,
+                str(exc),
+            )
+            LOGGER.error(traceback.format_exc())
+            database.mark_url_offline(es_client, thread_id, url, str(exc), status=database.URL_STATUS_DEAD)
+            _set_ioc_job_status(url, "failed", error=f"TorResolutionError: {str(exc)}")
+            st.session_state["ioc_cache_refresh_required"] = True
         except requests.exceptions.Timeout as exc:
             LOGGER.error(
                 "[SHADOWPULSE DEBUG] [TOR FETCH] Timeout operation_id=%s url=%s error=%s",
@@ -592,6 +618,10 @@ def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10, 
             tuple: (url, status_code)
         """
         url = update.get('onion_url')
+        should_skip, skip_reason = _should_skip_target_url(es_client, thread_id, url)
+        if should_skip:
+            print(f"[Status Check] Skipping {url}: {skip_reason}")
+            return (url, 0)
         try:
             # Use optimized make_request with strict 15-second timeout.
             # HEAD request is used instead of GET to avoid downloading full page content,
@@ -602,15 +632,23 @@ def check_link_status_concurrent(updates, es_client, thread_id, max_workers=10, 
                 timeout=15,
                 telemetry_callback=telemetry_callback,
                 engine_name=url,
+                raise_on_error=True,
             )
             code = response.status_code if response else 500
+        except tor_network.TorResolutionError as e:
+            print(f"[Status Check] Tor resolution failure on {url}: {e}")
+            database.mark_url_offline(es_client, thread_id, url, str(e), status=database.URL_STATUS_DEAD)
+            code = 0
         except Exception as e:
             print(f"[Status Check] Error on {url}: {e}")
             code = 500  # Treat errors as server error (500)
         
         # Thread-safe database update: each thread updates ES with the new status code
         try:
-            database.update_link_status(es_client, thread_id, url, code)
+            if code == 200:
+                database.mark_url_active(es_client, thread_id, url, status_code=code)
+            elif code != 0:
+                database.update_link_status(es_client, thread_id, url, code)
         except Exception as e:
             print(f"[Status Check] DB error: {e}")
         
@@ -903,6 +941,7 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                             max_workers=8,
                             progress_callback=update_scan_progress,
                             telemetry_callback=telemetry_callback,
+                            thread_id=st.session_state["current_thread_id"],
                         )
                     
                     # --- 5. ATTACH TO DATABASE ---
@@ -1216,7 +1255,13 @@ if st.session_state["current_page"] == "thread" and st.session_state["current_th
                 trusted_lookup = build_trusted_lookup(trusted_sources)
                 def run_scan_worker():
                     try:
-                        raw_results = search_engine.search_parallel(query, max_workers=min(8, max(2, len(config.SEARCH_ENGINES or []))), progress_callback=update_progress, telemetry_callback=telemetry_callback)
+                        raw_results = search_engine.search_parallel(
+                            query,
+                            max_workers=min(8, max(2, len(config.SEARCH_ENGINES or []))),
+                            progress_callback=update_progress,
+                            telemetry_callback=telemetry_callback,
+                            thread_id=st.session_state["current_thread_id"],
+                        )
                         normalized_results = []
                         for item in raw_results or []:
                             normalized = database.normalize_scan_result(item, trusted_lookup)

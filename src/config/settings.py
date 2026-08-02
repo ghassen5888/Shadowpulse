@@ -8,6 +8,7 @@ load_dotenv()
 # Locally: defaults to localhost
 TOR_PROXY_IP = os.getenv("TOR_PROXY_IP", "127.0.0.1")
 TOR_PORT = int(os.getenv("TOR_PORT", "9050"))
+OFFLINE_RETRY_COOLDOWN_HOURS = int(os.getenv("OFFLINE_RETRY_COOLDOWN_HOURS", "24"))
 
 # Elasticsearch Settings
 # In Docker: environment variable points to 'elasticsearch' service name

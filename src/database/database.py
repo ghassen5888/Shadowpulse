@@ -8,7 +8,7 @@ intelligence data. It manages operations, links, and status tracking.
 
 from elasticsearch import Elasticsearch
 from src.config import settings as config
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import traceback
 import uuid
@@ -18,6 +18,44 @@ from dotenv import load_dotenv
 
 load_dotenv()
 LOGGER = logging.getLogger(__name__)
+
+URL_STATUS_UNKNOWN = "UNKNOWN"
+URL_STATUS_ACTIVE = "ACTIVE"
+URL_STATUS_OFFLINE = "OFFLINE"
+URL_STATUS_DEAD = "DEAD"
+TOR_RESOLUTION_FAILURE_MARKERS = (
+    "no more hsdir available to query",
+    "hsdir",
+    "host unreachable",
+    "failed to establish a new connection",
+    "name or service not known",
+)
+
+
+def _normalize_url(url):
+    return str(url or "").strip()
+
+
+def _is_onion_url(url):
+    return ".onion" in _normalize_url(url).lower()
+
+
+def _status_is_offline_or_dead(status_value):
+    return str(status_value or "").upper() in {URL_STATUS_OFFLINE, URL_STATUS_DEAD}
+
+
+def _parse_iso_datetime(value):
+    try:
+        if not value:
+            return None
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def is_tor_resolution_failure(message):
+    message_text = str(message or "").lower()
+    return any(marker in message_text for marker in TOR_RESOLUTION_FAILURE_MARKERS)
 def get_es_client(max_retries=5, sleep_seconds=2):
     """
     Connect to the Elasticsearch database with retry logic.
@@ -231,18 +269,26 @@ def save_intel_update(client, thread_id, url, title, content, tags=None, last_st
     
     tags = tags or []
     trust_status_value = trust_status or "Untrusted"
+    normalized_url = _normalize_url(url)
+    existing_record = get_url_record(client, thread_id, normalized_url)
+    existing_status = str((existing_record or {}).get("onion_status") or URL_STATUS_UNKNOWN).upper()
+    preserved_status = existing_status if existing_status in {URL_STATUS_OFFLINE, URL_STATUS_DEAD, URL_STATUS_ACTIVE} else URL_STATUS_UNKNOWN
 
     # Create the intel update document structure
     doc = {
         "type": "intel_update",                    # Document type identifier
         "thread_id": thread_id,                    # Link this intel to a thread
-        "onion_url": url,                          # The discovered .onion URL
+        "onion_url": normalized_url,               # The discovered .onion URL
         "title": title,                            # Page title or link text
         "summary": content[:500] + "...",          # First 500 characters as summary
         "full_content": content,                   # Full page content for deep search
         "scraped_at": datetime.now().isoformat(), # ISO timestamp of when we scraped it
         "tags": tags,                              # User-defined tags for search/filter
-        "last_status_code": last_status_code,
+        "last_status_code": int(last_status_code or 0),
+        "onion_status": preserved_status,
+        "offline_marked_at": (existing_record or {}).get("offline_marked_at"),
+        "offline_retry_after": (existing_record or {}).get("offline_retry_after"),
+        "last_failure_reason": (existing_record or {}).get("last_failure_reason"),
         "trust_status": trust_status_value,
         "is_trusted": trust_status_value == "Trusted",
     }
@@ -250,7 +296,7 @@ def save_intel_update(client, thread_id, url, title, content, tags=None, last_st
     # Create a unique ID by combining thread_id and URL.
     # This prevents duplicates: if the same URL is added to a thread twice,
     # the second save will overwrite the first (not create a duplicate).
-    unique_id = f"{thread_id}_{url}"
+    unique_id = f"{thread_id}_{normalized_url}"
     client.index(index=config.INDEX_NAME, id=unique_id, document=doc)
     print(f"[Database] Attached intel to Thread {thread_id}")
     return True
@@ -299,6 +345,10 @@ def save_cti_extraction(
         "scraped_at": datetime.now().isoformat(),
         "tags": tags,
         "last_status_code": int(last_status_code or 0),
+        "onion_status": URL_STATUS_ACTIVE if int(last_status_code or 0) == 200 else URL_STATUS_UNKNOWN,
+        "offline_marked_at": None,
+        "offline_retry_after": None,
+        "last_failure_reason": None,
         "trust_status": trust_status,
         "is_trusted": trust_status == "Trusted",
     }
@@ -360,6 +410,101 @@ def get_thread_data(client, thread_id):
     
     return [h['_source'] for h in resp['hits']['hits']]
 
+
+def get_url_record(client, thread_id, url):
+    """Return the stored intel document for a thread/url pair if it exists."""
+    unique_id = f"{thread_id}_{url}"
+    try:
+        response = client.get(index=config.INDEX_NAME, id=unique_id)
+    except Exception:
+        return None
+    if not response.get("found"):
+        return None
+    return response.get("_source") or {}
+
+
+def is_url_in_offline_cooldown(client, thread_id, url):
+    """
+    Check whether a URL is currently blocked by OFFLINE/DEAD cooldown policy.
+
+    Returns:
+        tuple[bool, str]: (should_skip, reason)
+    """
+    normalized_url = _normalize_url(url)
+    if not normalized_url or not _is_onion_url(normalized_url):
+        return False, ""
+
+    record = get_url_record(client, thread_id, normalized_url)
+    if not record:
+        return False, ""
+
+    onion_status = str(record.get("onion_status") or URL_STATUS_UNKNOWN).upper()
+    retry_after = _parse_iso_datetime(record.get("offline_retry_after"))
+    if _status_is_offline_or_dead(onion_status) and retry_after and retry_after > datetime.now(retry_after.tzinfo):
+        return True, f"{onion_status} until {retry_after.isoformat()}"
+    return False, ""
+
+
+def mark_url_offline(client, thread_id, url, reason, status=URL_STATUS_OFFLINE, last_status_code=0):
+    """Mark a URL as OFFLINE/DEAD with a cooldown so workers skip immediate retries."""
+    normalized_url = _normalize_url(url)
+    if not normalized_url:
+        return False
+
+    cooldown_hours = max(int(getattr(config, "OFFLINE_RETRY_COOLDOWN_HOURS", 24) or 24), 1)
+    now = datetime.now()
+    retry_after = now + timedelta(hours=cooldown_hours)
+    offline_status = status if status in {URL_STATUS_OFFLINE, URL_STATUS_DEAD} else URL_STATUS_OFFLINE
+    update_doc = {
+        "type": "intel_update",
+        "thread_id": thread_id,
+        "onion_url": normalized_url,
+        "onion_status": offline_status,
+        "last_status_code": int(last_status_code or 0),
+        "offline_marked_at": now.isoformat(),
+        "offline_retry_after": retry_after.isoformat(),
+        "last_failure_reason": str(reason or "Tor resolution failed"),
+        "scraped_at": now.isoformat(),
+    }
+
+    try:
+        client.update(
+            index=config.INDEX_NAME,
+            id=f"{thread_id}_{normalized_url}",
+            doc=update_doc,
+            doc_as_upsert=True,
+        )
+        return True
+    except Exception as exc:
+        print(f"[Database] Error marking URL offline: {exc}")
+        return False
+
+
+def mark_url_active(client, thread_id, url, status_code=200):
+    """Mark a URL as active after a successful fetch."""
+    normalized_url = _normalize_url(url)
+    if not normalized_url:
+        return False
+
+    update_doc = {
+        "last_status_code": int(status_code or 200),
+        "onion_status": URL_STATUS_ACTIVE,
+        "offline_marked_at": None,
+        "offline_retry_after": None,
+        "last_failure_reason": None,
+    }
+    try:
+        client.update(
+            index=config.INDEX_NAME,
+            id=f"{thread_id}_{normalized_url}",
+            doc=update_doc,
+            doc_as_upsert=False,
+        )
+        return True
+    except Exception as exc:
+        print(f"[Database] Error marking URL active: {exc}")
+        return False
+
 def update_link_status(client, thread_id, url, status_code):
     """
     Update the HTTP status code for a discovered link.
@@ -380,12 +525,21 @@ def update_link_status(client, thread_id, url, status_code):
     # Construct the unique document ID (matches the ID used in save_intel_update)
     unique_id = f"{thread_id}_{url}"
     
-    try: 
-        # Update only the last_status_code field (partial update, not full replacement)
-        client.update(index=config.INDEX_NAME, id=unique_id, doc={"last_status_code": status_code}) 
-        return True 
-    except Exception as e: 
-        print(f"Error updating status: {e}") 
+    try:
+        status_doc = {"last_status_code": int(status_code or 0)}
+        if int(status_code or 0) == 200:
+            status_doc.update(
+                {
+                    "onion_status": URL_STATUS_ACTIVE,
+                    "offline_marked_at": None,
+                    "offline_retry_after": None,
+                    "last_failure_reason": None,
+                }
+            )
+        client.update(index=config.INDEX_NAME, id=unique_id, doc=status_doc)
+        return True
+    except Exception as e:
+        print(f"Error updating status: {e}")
         return False
 
 def delete_intel_update(client, thread_id, url):

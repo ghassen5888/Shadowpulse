@@ -100,7 +100,7 @@ def fetch_from_engine(url_template, query, telemetry_callback=None):
         return []
 
 
-def search_parallel(query, max_workers=8, progress_callback=None, telemetry_callback=None):
+def search_parallel(query, max_workers=8, progress_callback=None, telemetry_callback=None, thread_id=None):
     """Search multiple dark-web engines in parallel and deduplicate the results."""
     engines = list(config.SEARCH_ENGINES or [])
     total_engines = max(1, len(engines))
@@ -159,10 +159,15 @@ def search_parallel(query, max_workers=8, progress_callback=None, telemetry_call
             filtered_list = []
             for item in unique_list:
                 onion_url = str(item.get("onion_url") or "").strip()
-                if not database.is_url_globally_banned(es_client, onion_url):
-                    filtered_list.append(item)
-                else:
+                if database.is_url_globally_banned(es_client, onion_url):
                     print(f"   [Filtered] Globally banned link skipped: {onion_url}")
+                    continue
+                if thread_id:
+                    should_skip, skip_reason = database.is_url_in_offline_cooldown(es_client, thread_id, onion_url)
+                    if should_skip:
+                        print(f"   [Filtered] Offline cooldown skip: {onion_url} ({skip_reason})")
+                        continue
+                filtered_list.append(item)
             unique_list = filtered_list
     except Exception as exc:
         LOGGER.warning("Could not filter globally banned links: %s", exc)

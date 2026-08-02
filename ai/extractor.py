@@ -51,7 +51,7 @@ class HybridIntelligenceEngine:
         llm_start = perf_counter()
         try:
             llm_intel = self.llm_client.extract_intelligence(clean_text)
-            if (llm_intel.summary or "").strip() == "LLM processing unavailable":
+            if (llm_intel.summary or "").strip().startswith("LLM extraction unavailable"):
                 LOGGER.error(
                     "[SHADOWPULSE DEBUG] [CRITICAL FAILURE] [EXTRACTOR] source=%s llm_returned_generic_fallback",
                     url,

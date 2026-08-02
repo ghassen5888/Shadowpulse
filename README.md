@@ -28,7 +28,7 @@ STIX 2.1 Integration: Automatically packages gathered intel (Indicators, Observe
 
 *Tor (SOCKS5 Proxy)*: Provides the anonymity layer.
 
-*Requests / HTTPAdapter*: Configured with advanced retry logic, connection pooling, and strict timeouts to handle the unstable nature of the dark web.
+*Requests / HTTPAdapter*: Configured with connection pooling and strict no-retry Tor resolution behavior to avoid hidden-service retry storms.
 
 *Concurrent Futures*: Asynchronous multi-threading for blazing-fast parallel web scraping.
 
@@ -95,6 +95,10 @@ Use the Check Link Status (Ping All) button to run a concurrent HEAD request aga
 4. Deep Crawl
 
 Click the Deep Crawl button next to any active link. The platform will perform a full HTTP GET request, scrape the raw HTML of the hidden service, and archive it directly into the Elasticsearch case file for safe, offline reading.
+
+Offline hidden-service protection:
+- If Tor resolution fails for an onion endpoint (HSDir/proxy/host-unreachable path), the target is marked `OFFLINE/DEAD`.
+- Dead/offline links are skipped for automated fetch/status workflows until cooldown expiry (default: 24 hours via `OFFLINE_RETRY_COOLDOWN_HOURS`).
 
 5. Export STIX 2.1 (SIEM Integration)
 
