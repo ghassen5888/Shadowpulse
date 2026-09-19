@@ -1,110 +1,150 @@
-🕵*** Shadowpulse: Dark Web Threat Intelligence Platform***
+# Shadowpulse
 
-Shadowpulse is an advanced, concurrent Cyber Threat Intelligence (CTI) platform designed to scrape, analyze, and catalog dark web telemetry. By routing multi-threaded search operations through a Tor SOCKS5 proxy, it safely aggregates Open-Source Intelligence (OSINT) from hidden services (.onion domains) and exports the data in enterprise-standard STIX 2.1 bundles.
+Automated Dark Web CTI Engine | Python, Tor, Gemini API, Elasticsearch, Docker
 
-***Key Features***
+Shadowpulse is a dark-web cyber threat intelligence platform designed to automate collection, enrichment, and structured CTI extraction from hidden services. The system routes searches through Tor, crawls onion targets, strips noisy forum content, and feeds extracted intelligence into a Gemini-based AI pipeline before indexing findings in Elasticsearch and exposing them through a Streamlit dashboard.
 
-Parallel Dark Web Scanning: Utilizes advanced Python threading (ThreadPoolExecutor) to query multiple onion search engines concurrently without freezing the UI.
+## What the platform does
 
-True Anonymity Routing: Strictly routes all HTTP requests and DNS resolutions through a local Tor proxy (socks5h://) to prevent DNS leaks and ensure operational security.
+- Anonymized Scraping Engine: Built around Tor SOCKS5 proxying and circuit-aware request handling to safely query and crawl ephemeral dark web services.
+- Resilient AI Pipeline: Uses a 5-tier Google Gemini fallback chain with proxy isolation to enforce structured JSON extraction of threat actors, MITRE ATT&CK techniques, malware, victims, and IOCs.
+- CTI Preprocessing & Indexing: Cleans raw HTML/forum content, extracts indicators such as IPs, hashes, wallet addresses, CVEs, and URLs, and stores normalized payloads in Elasticsearch.
+- Architecture Deployment: Runs as a multi-service Docker Compose stack with a Streamlit UI for live monitoring and analyst-driven threat investigation.
 
-Elasticsearch Backend: High-performance storage of operational threads, scraped raw data, and historical threat indicators.
+## Core capabilities
 
-Live Telemetry & Diagnostics: Real-time UI progress bars and a thread-safe telemetry buffer to monitor Tor circuit health, connection latency, and HTTP statuses.
+- Parallel onion search across multiple dark-web indexes via Tor-enabled requests
+- Search result validation, URL health checks, and offline retry protection
+- HTML noise stripping and structured IOC extraction from crawled content
+- Threat intelligence normalization into JSON and STIX 2.1-compatible outputs
+- Real-time dashboard views for telemetry, link status, and CTI extraction results
+- Elasticsearch-backed persistence for operational history and stored findings
 
-STIX 2.1 Integration: Automatically packages gathered intel (Indicators, Observed Data, and Relationships) into universally accepted OASIS STIX 2.1 JSON bundles for SIEM integration.
+## Tech stack
 
-***Technologies Used***
+- Python
+- Tor SOCKS5 proxying
+- Google Gemini API (google-genai)
+- Elasticsearch
+- Docker / Docker Compose
+- Streamlit
+- Requests, BeautifulSoup, pandas, altair
+- STIX 2.1 export support
 
-**Frontend & UI:**
+## Architecture overview
 
-*Streamlit*: Powers the real-time, interactive analyst dashboard (st.session_state, custom fragments, Altair charts).
+1. Search layer
+  - Queries known onion search engines and dark-net directories through Tor.
+2. Proxy & network layer
+  - Forces outbound traffic through the Tor SOCKS5 proxy and applies connection/circuit safeguards.
+3. Crawl & preprocessing layer
+  - Downloads pages, strips HTML noise, extracts raw content, and normalizes indicators.
+4. AI extraction layer
+  - Sends cleaned text to a Gemini client with a fallback model chain for schema-validated CTI extraction.
+5. Storage & analytics layer
+  - Stores structured results and metadata in Elasticsearch and visualizes them via Streamlit.
+6. Export layer
+  - Produces STIX 2.1 and JSON artifacts suitable for downstream TI workflows.
 
-*Altair / Pandas*: Data visualization for global operation statistics and active/dead link ratios.
+## Repository layout
 
-**Core Engine & Networking**
+- `app.py` — Streamlit application entrypoint
+- `main.py` — project startup and orchestration entrypoint
+- `src/` — core networking, crawling, indexing, and dashboard logic
+- `ai/` — Gemini client, schemas, and CTI extraction helpers
+- `docker/` — container configuration and Tor settings
+- `tests/` — pipeline and exporter validation tests
 
-*Python 3.10+*: Core backend engine.
+## Requirements
 
-*Tor (SOCKS5 Proxy)*: Provides the anonymity layer.
+- Docker and Docker Compose
+- Python 3.10+
+- A valid Gemini API key for the LLM extraction pipeline
 
-*Requests / HTTPAdapter*: Configured with connection pooling and strict no-retry Tor resolution behavior to avoid hidden-service retry storms.
-
-*Concurrent Futures*: Asynchronous multi-threading for blazing-fast parallel web scraping.
-
-**Database & Standards:**
-
-*Elasticsearch*: Fast, scalable NoSQL document store for archiving scraped HTML and thread metadata.
-
-*STIX 2.1 (stix2 Python SDK)*: Standardized threat intelligence formatting.
-
-***Installation & Setup***
-
-Shadowpulse is designed to run in an isolated containerized environment to ensure proxy rules are strictly enforced.
-
-Prerequisites
-
-Docker & Docker Compose
-
-Git
-
-Quick Start
+## Quick start
 
 Clone the repository:
 
+```bash
 git clone https://github.com/ghassen5888/Shadowpulse.git
 cd shadowpulse
+```
 
+Create a local environment file with your Gemini configuration:
 
-Start the environment:
-Bring up the Streamlit App, Tor Proxy, and Elasticsearch containers.
+```bash
+cp .env.example .env
+```
 
+If `.env.example` is not present, create `.env` manually with values similar to:
+
+```bash
+GEMINI_API_KEY=your_api_key_here
+GEMINI_MODEL=gemini-2.5-flash
+ES_HOST=http://127.0.0.1:9200
+TOR_PROXY_IP=127.0.0.1
+TOR_PORT=9050
+```
+
+Start the full stack:
+
+```bash
 docker compose up --build -d
+```
 
+Access the dashboard:
 
-Verify Tor Circuit:
-Ensure the Tor network is bootstrapped by checking the proxy container logs.
-
-docker logs shadowpulse-tor -f
-
-
-Access the Dashboard:
-Open your browser and navigate to:
+```text
 http://localhost:8501
+```
 
- ***How to Use the Platform***
+Verify services:
 
-1. Create an Operation (Thread)
+```bash
+docker compose ps
+curl http://localhost:9200
+```
 
-On the left sidebar, enter a name under New Operation Name (e.g., Op Red Sparrow) and click Create Operation. This acts as your isolated workspace/case file.
+## Configuration
 
-2. Scan & Attach Intelligence
+The project reads its settings from environment variables and defaults for local and containerized execution. Key variables include:
 
-In the main window, type a search term or threat actor name into the Add Intel search bar.
+- `TOR_PROXY_IP` — Tor proxy host
+- `TOR_PORT` — Tor SOCKS proxy port (default: 9050)
+- `ES_HOST` — Elasticsearch endpoint
+- `GEMINI_API_KEY` — API key used by the Gemini client
+- `GEMINI_MODEL` — primary model name in the fallback chain
+- `OFFLINE_RETRY_COOLDOWN_HOURS` — cooldown period for dead onion targets
 
-Click Scan & Attach.
+## Typical workflow
 
-Shadowpulse will spawn background workers to query up to 17 dark web engines simultaneously. The progress bar will update in real-time.
+1. Create an investigation thread or operation in the dashboard.
+2. Search for a keyword, threat actor, or malware family.
+3. Shadowpulse queries onion search engines through Tor.
+4. The crawler validates and scrapes active targets.
+5. The content is cleaned and parsed for CTI indicators.
+6. Gemini extracts structured intelligence (threat actors, attack techniques, victims, summary, etc.).
+7. Results are indexed in Elasticsearch and surfaced in the UI.
+8. CTI data can be exported as STIX 2.1 and JSON bundles.
 
-Once completed, discovered .onion links are automatically saved to the Elasticsearch database and attached to your active Operation.
+## Data processing notes
 
-3. Monitor Link Health
+- Raw forum and page HTML is normalized to remove noise before CTI extraction.
+- Indicator extraction focuses on actionable signals such as:
+ - IP addresses
+ - file hashes
+ - cryptocurrency wallet addresses
+ - CVEs
+ - URLs / onion links
+ - email addresses
+- Gemini output is validated against a strict JSON schema before being accepted by the pipeline.
 
-Use the Check Link Status (Ping All) button to run a concurrent HEAD request against all attached links. A pie chart will dynamically update to show which .onion endpoints are still active and which are currently offline.
+## Security and legal use
 
-4. Deep Crawl
+This project is intended for authorized cybersecurity research, threat hunting, and defensive intelligence workflows. Use it only in compliance with local laws, organizational policies, and relevant legal constraints.
 
-Click the Deep Crawl button next to any active link. The platform will perform a full HTTP GET request, scrape the raw HTML of the hidden service, and archive it directly into the Elasticsearch case file for safe, offline reading.
+Do not bypass the Tor proxy or run the stack on untrusted or non-anonymized networks.
 
-Offline hidden-service protection:
-- If Tor resolution fails for an onion endpoint (HSDir/proxy/host-unreachable path), the target is marked `OFFLINE/DEAD`.
-- Dead/offline links are skipped for automated fetch/status workflows until cooldown expiry (default: 24 hours via `OFFLINE_RETRY_COOLDOWN_HOURS`).
+## License
 
-5. Export STIX 2.1 (SIEM Integration)
-
-(If enabled in UI) Analysts can export the Operation's findings. Shadowpulse generates a .json file containing Identity, Indicator, Observed-Data, and Relationship objects, ready to be ingested by enterprise firewalls or Threat Intelligence Platforms (TIPs).
-
-⚠️ ***Disclaimer & OpSec Warning***
-
-This tool is built for authorized cybersecurity research, threat hunting, and intelligence gathering. Ensure you comply with all local laws and organizational policies when accessing the dark web.
-Never bypass the Tor container proxy or run the engine on a personal, un-proxied network connection.
+This project is provided as-is for research and internal security operations. Review the repository license before production deployment or redistribution.
